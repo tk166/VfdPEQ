@@ -30,6 +30,8 @@ struct Conf {
     float preampDb[2] = {0.0f, 0.0f};
     std::string outputName;            // real output device (engine hot-switches on change)
     std::vector<Band> ch[2];           // [0]=L, [1]=R (mirror of L in L=R mode)
+    int hueIdx = 0;                    // GUI: phosphor theme index (persisted for restarts)
+    int rngIdx = 3;                    // GUI: FR y-axis range index (±24dB default)
 };
 
 inline void trimInPlace(std::string& s) {
@@ -73,6 +75,16 @@ inline Conf load(const char* path) {
             c.outputName = s;
             continue;
         }
+        if (strncmp(line, "hue", 3) == 0) {
+            int v = 0;
+            if (sscanf(line + 3, "%d", &v) == 1) c.hueIdx = v;
+            continue;
+        }
+        if (strncmp(line, "rng", 3) == 0) {
+            int v = 0;
+            if (sscanf(line + 3, "%d", &v) == 1) c.rngIdx = v;
+            continue;
+        }
         if (strncmp(line, "channel", 7) == 0) {
             char side[8] = "";
             if (sscanf(line + 7, "%7s", side) == 1) cur = (side[0] == 'R' || side[0] == 'r') ? 1 : 0;
@@ -106,6 +118,8 @@ inline bool save(const char* path, const Conf& c) {
     fprintf(f, "preamp %.2f\n", c.preampDb[0]);
     if (c.lrMode) fprintf(f, "preampR %.2f\n", c.preampDb[1]);
     if (!c.outputName.empty()) fprintf(f, "output_name %s\n", c.outputName.c_str());
+    fprintf(f, "hue %d\n", c.hueIdx);
+    fprintf(f, "rng %d\n", c.rngIdx);
     const int last = c.lrMode ? 1 : 0;
     for (int side = 0; side <= last; ++side) {
         if (c.lrMode) fprintf(f, "channel %s\n", side == 0 ? "L" : "R");

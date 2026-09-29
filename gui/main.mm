@@ -42,6 +42,7 @@ static std::string g_confPath = "peq.conf";
 static bool   g_dirtySave = false;
 static double g_lastSave  = 0;
 static FRData g_fr;
+static FRData g_frOther;                         // L/R 模式：另一声道的频响（暗线）
 static bool   g_frDirty = true;
 static int    g_hoverCol = -1;               // FR/频谱悬停列（-1 = 无）
 
@@ -85,7 +86,8 @@ static CtlGlow g_glowVol[7];   // [0]=IN [1]=OUT [2]=> [3]=mode [4]=L [5]=R [6]=
 static CtlGlow g_glowBand[vfdrender::Screen::kBandRows][5];  // on/type/freq/gain/q
 static ImVec2  g_imgOrigin;                      // 点阵屏在窗口中的位置（点）
 static const float kFrRanges[] = {6, 12, 18, 24, 36};
-static int g_frRangeIdx = 3;                     // 默认 ±24dB
+static int g_frRangeIdx = 3;                     // 默认 ±24dB（conf 持久化）
+static int g_themeIdx = 0;                       // 磷光主题索引（conf 持久化）
 static NSWindow* g_window = nil;                 // 导入/导出对话框的 sheet 挂靠窗口
 
 // project paths, resolved relative to the executable (gui/build/peq_gui -> project root)
@@ -315,6 +317,8 @@ static void vfdStep(double dt) {
         // 241 行：声量计 + 按钮排 + FR(61 行) + 频谱(50 行) + 控件区（2 音量行 + 10 band 行）
         g_screen = new vfdrender::Screen(220, 241, 3, 2, -78.0f, 0.0f);
         g_screen->configureDual(true);   // 组合屏：顶部声量计 + 按钮排 + FR + 频谱 + 控件区
+        g_screen->setTheme((vfdrender::Theme)std::clamp(g_themeIdx, 0, vfdrender::kThemeCount - 1));
+        g_screen->setFrRange(kFrRanges[std::clamp(g_frRangeIdx, 0, 4)]);
     }
     if (!g_shm) {
         g_shm = shmring::ShmFrameRing::open("/systempeq_audio");
@@ -381,25 +385,30 @@ static void vfdStep(double dt) {
         g_screen->drawMeters(g_meters.vuNorm(), g_meters.peakNorm(), g_meters.channels());
     }
 
-    // FR 子区：只画最终频响（高亮，响应参数变化，带磷光余辉）
+    // FR 子区：亮线 = 当前编辑声道；L/R 模式另画暗线 = 另一声道（带磷光余辉）
     if (g_frDirty) {
         computeFR(editBands(), g_appliedRate > 0 ? g_appliedRate : 48000, g_fr);
+        if (g_conf.lrMode)
+            computeFR(g_conf.ch[1 - g_curCh], g_appliedRate > 0 ? g_appliedRate : 48000, g_frOther);
         g_frDirty = false;
     }
     const int pw = g_screen->plotWidth();
-    const int N = (int)g_fr.comp.size();
-    if (N > 1) {
+    auto plotLine = [&](const std::vector<float>& comp, float intensity) {
+        const int N = (int)comp.size();
+        if (N <= 1) return;
         for (int c = 0; c < pw; ++c) {
             const float u = (float)c / (float)(pw - 1);
             const float x = u * (float)(N - 1);
             const int i0 = (int)x;
             const int i1 = std::min(N - 1, i0 + 1);
             const float fr = x - (float)i0;
-            float dbc = g_fr.comp[i0] * (1.0f - fr) + g_fr.comp[i1] * fr;
+            float dbc = comp[i0] * (1.0f - fr) + comp[i1] * fr;
             if (g_conf.bypass) dbc = 0.0f;                  // 总开关旁路：0dB 平线
-            g_screen->frDotDb(u, dbc, 1.0f);
+            g_screen->frDotDb(u, dbc, intensity);
         }
-    }
+    };
+    if (g_conf.lrMode) plotLine(g_frOther.comp, 0.35f);     // 暗线：另一声道
+    plotLine(g_fr.comp, 1.0f);                              // 亮线：当前编辑声道
 
     g_screen->applyPersistence((float)std::min(dt, 0.25), 0.07f);
     g_screen->render(g_rgb);
@@ -560,9 +569,12 @@ static bool exportEqapo(const char* path) {
         fprintf(f, "Preamp: %.1f dB\n", g_conf.preampDb[0]);
         writeFilters(f, g_conf.ch[0]);
     } else {
-        fprintf(f, "Channel: L\nPreamp: %.1f dB\n", g_conf.preampDb[0]);
+        // EQAPO Channel Selection 风格：每段 = 声道声明 + 该声道 preamp + 该声道 PEQ
+        fprintf(f, "Channel: L\n");
+        fprintf(f, "Preamp: %.1f dB\n", g_conf.preampDb[0]);
         writeFilters(f, g_conf.ch[0]);
-        fprintf(f, "Channel: R\nPreamp: %.1f dB\n", g_conf.preampDb[1]);
+        fprintf(f, "\nChannel: R\n");
+        fprintf(f, "Preamp: %.1f dB\n", g_conf.preampDb[1]);
         writeFilters(f, g_conf.ch[1]);
     }
     fclose(f);
@@ -761,6 +773,8 @@ static void drawControlInteractions(double dt) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("RNG - FR y-axis range, cycles +/-6/12/18/24/36 dB");
         if (ImGui::IsItemClicked(0)) {
             g_frRangeIdx = (g_frRangeIdx + 1) % 5;
+            g_conf.rngIdx = g_frRangeIdx;
+            g_dirtySave = true;
             g_screen->setFrRange(kFrRanges[g_frRangeIdx]);
         }
     }
@@ -783,7 +797,11 @@ static void drawControlInteractions(double dt) {
         float d; bool act;
         ctlHotzone("hue", rB[4], g_glowSide[4], dt, d, act);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("HUE - cycle phosphor color theme");
-        if (ImGui::IsItemClicked(0)) g_screen->nextTheme();
+        if (ImGui::IsItemClicked(0)) {
+            g_screen->nextTheme();
+            g_conf.hueIdx = (int)g_screen->theme();
+            g_dirtySave = true;
+        }
     }
     // FLT：全部拉平
     {
@@ -918,10 +936,10 @@ static void drawControlInteractions(double dt) {
         float d; bool act;
         ctlHotzone("chL", rChL, g_glowVol[4], dt, d, act);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit channel L");
-        if (ImGui::IsItemClicked(0)) g_curCh = 0;
+        if (ImGui::IsItemClicked(0)) { g_curCh = 0; g_frDirty = true; }
         ctlHotzone("chR", rChR, g_glowVol[5], dt, d, act);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit channel R");
-        if (ImGui::IsItemClicked(0)) g_curCh = 1;
+        if (ImGui::IsItemClicked(0)) { g_curCh = 1; g_frDirty = true; }
     }
     // Preamp 滑条（±12dB，L/R 模式下独立）：
     {
@@ -1052,8 +1070,11 @@ static void drawFrame(id<MTLDevice> device) {
     g_imgOrigin = ImGui::GetItemRectMin();
 
     // 图形区悬停：FR/频谱 → 贯穿竖线 + 频率/FR值；声量计 → L/R dB 读数
+    // sheet（导入/导出面板）打开时冻结交互：ImGui_ImplOSX 的全局鼠标监听会把
+    // finder 里的点击穿透进来，热区若继续活跃就会误触发音量/参数动作
+    const bool modalUp = (g_window && g_window.attachedSheet != nil);
     g_hoverCol = -1;
-    if (ImGui::IsItemHovered()) {
+    if (ImGui::IsItemHovered() && !modalUp) {
         const ImVec2 m = ImGui::GetMousePos();
         const int col = (int)std::floor((m.x - g_imgOrigin.x) / (float)cellPx());
         const int row = (int)std::floor((m.y - g_imgOrigin.y) / (float)cellPx());
@@ -1089,7 +1110,7 @@ static void drawFrame(id<MTLDevice> device) {
     }
 
     ensureVolumeBindings();
-    drawControlInteractions(dt);
+    if (!modalUp) drawControlInteractions(dt);   // sheet 期间冻结热区（见上）
 
     ImGui::End();
     ImGui::PopStyleVar(2);
@@ -1156,6 +1177,8 @@ int main(int argc, const char** argv) {
         if (g_conf.ch[0].empty())
             for (int i = 0; i < 10; ++i) g_conf.ch[0].push_back(peqconf::Band{});
         if (!g_conf.lrMode) g_conf.ch[1] = g_conf.ch[0];
+        g_themeIdx    = std::clamp(g_conf.hueIdx, 0, vfdrender::kThemeCount - 1);
+        g_frRangeIdx  = std::clamp(g_conf.rngIdx, 0, 4);
         fprintf(stderr, "[gui] L=%zu R=%zu bands from %s (lr=%d bypass=%d preamp=%.1f/%.1f)\n",
                 g_conf.ch[0].size(), g_conf.ch[1].size(), g_confPath.c_str(), (int)g_conf.lrMode,
                 (int)g_conf.bypass, g_conf.preampDb[0], g_conf.preampDb[1]);
