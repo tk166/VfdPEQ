@@ -1,0 +1,5 @@
+engine/build
+driver/build
+gui/build
+*.status
+*.conf
