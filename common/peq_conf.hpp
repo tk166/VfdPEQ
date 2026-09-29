@@ -1,6 +1,12 @@
 // Shared PEQ config file format (used by GUI; engine's engine/config.hpp parses the same)
-// Line format:  type freq gainDB q enabled      (type: lowshelf|peaking|highshelf)
-// Global line:  bypass 0|1                      (optional; missing = EQ active)
+//
+//   "# L=R" | "# L/R"         channel mode comment (missing = L=R)
+//   bypass 0|1                EQ master bypass
+//   preamp <dB>               L (or global in L=R) preamp
+//   preampR <dB>              R preamp (L/R mode)
+//   output_name <name...>     real output device (may contain spaces)
+//   channel L | channel R     band lines belong to that channel (L/R mode)
+//   <type> <freq> <gain> <q> <enabled>      band line
 #pragma once
 #include "../engine/biquad.hpp"
 #include <cstdio>
@@ -18,17 +24,58 @@ struct Band {
     double q      = 1.0;
 };
 
-inline std::vector<Band> load(const char* path, bool* bypass = nullptr) {
-    std::vector<Band> out;
-    if (bypass) *bypass = false;
+struct Conf {
+    bool bypass = false;
+    bool lrMode = false;               // true = L/R independent
+    float preampDb[2] = {0.0f, 0.0f};
+    std::string outputName;            // real output device (engine hot-switches on change)
+    std::vector<Band> ch[2];           // [0]=L, [1]=R (mirror of L in L=R mode)
+};
+
+inline void trimInPlace(std::string& s) {
+    const char* ws = " \t\r\n";
+    size_t b = s.find_first_not_of(ws);
+    size_t e = s.find_last_not_of(ws);
+    s = (b == std::string::npos) ? "" : s.substr(b, e - b + 1);
+}
+
+inline Conf load(const char* path) {
+    Conf c;
     FILE* f = fopen(path, "r");
-    if (!f) return out;
-    char line[256];
+    if (!f) return c;
+    int cur = 0;
+    char line[512];
     while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+        if (line[0] == '#') {
+            if (strncmp(line, "# L/R", 5) == 0) c.lrMode = true;
+            else if (strncmp(line, "# L=R", 5) == 0) c.lrMode = false;
+            continue;
+        }
+        if (line[0] == '\n' || line[0] == '\0') continue;
         if (strncmp(line, "bypass", 6) == 0) {
             int v = 0;
-            if (sscanf(line + 6, "%d", &v) == 1 && bypass) *bypass = (v != 0);
+            if (sscanf(line + 6, "%d", &v) == 1) c.bypass = (v != 0);
+            continue;
+        }
+        if (strncmp(line, "preampR", 7) == 0) {
+            float v = 0;
+            if (sscanf(line + 7, "%f", &v) == 1) c.preampDb[1] = v;
+            continue;
+        }
+        if (strncmp(line, "preamp", 6) == 0) {
+            float v = 0;
+            if (sscanf(line + 6, "%f", &v) == 1) c.preampDb[0] = v;
+            continue;
+        }
+        if (strncmp(line, "output_name", 11) == 0) {
+            std::string s = line + 11;
+            trimInPlace(s);
+            c.outputName = s;
+            continue;
+        }
+        if (strncmp(line, "channel", 7) == 0) {
+            char side[8] = "";
+            if (sscanf(line + 7, "%7s", side) == 1) cur = (side[0] == 'R' || side[0] == 'r') ? 1 : 0;
             continue;
         }
         char type[32] = "";
@@ -43,23 +90,31 @@ inline std::vector<Band> load(const char* path, bool* bypass = nullptr) {
         if      (strcmp(type, "lowshelf")  == 0) b.type = FilterType::LowShelf;
         else if (strcmp(type, "highshelf") == 0) b.type = FilterType::HighShelf;
         else                                     b.type = FilterType::Peaking;
-        out.push_back(b);
+        c.ch[cur].push_back(b);
     }
     fclose(f);
-    return out;
+    if (!c.lrMode) c.ch[1] = c.ch[0];
+    return c;
 }
 
-inline bool save(const char* path, const std::vector<Band>& bands, bool bypass = false) {
+inline bool save(const char* path, const Conf& c) {
     FILE* f = fopen(path, "w");
     if (!f) return false;
     fprintf(f, "# SystemPEQ config - hot-reloaded by the engine\n");
-    fprintf(f, "# format: type freq gainDB q enabled | global: bypass 0|1\n");
-    fprintf(f, "bypass %d\n", bypass ? 1 : 0);
-    for (const auto& b : bands) {
-        fprintf(f, "%-9s %8.1f %6.2f %5.2f %d\n",
-                b.type == FilterType::LowShelf ? "lowshelf" :
-                b.type == FilterType::HighShelf ? "highshelf" : "peaking",
-                b.freq, b.gainDB, b.q, b.enabled ? 1 : 0);
+    fprintf(f, c.lrMode ? "# L/R\n" : "# L=R\n");
+    fprintf(f, "bypass %d\n", c.bypass ? 1 : 0);
+    fprintf(f, "preamp %.2f\n", c.preampDb[0]);
+    if (c.lrMode) fprintf(f, "preampR %.2f\n", c.preampDb[1]);
+    if (!c.outputName.empty()) fprintf(f, "output_name %s\n", c.outputName.c_str());
+    const int last = c.lrMode ? 1 : 0;
+    for (int side = 0; side <= last; ++side) {
+        if (c.lrMode) fprintf(f, "channel %s\n", side == 0 ? "L" : "R");
+        for (const auto& b : c.ch[side]) {
+            fprintf(f, "%-9s %8.1f %6.2f %5.2f %d\n",
+                    b.type == FilterType::LowShelf ? "lowshelf" :
+                    b.type == FilterType::HighShelf ? "highshelf" : "peaking",
+                    b.freq, b.gainDB, b.q, b.enabled ? 1 : 0);
+        }
     }
     fclose(f);
     return true;

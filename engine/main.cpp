@@ -8,6 +8,7 @@
 //        press Enter to accept the suggested device, or type its number
 //   3. Edit peq.conf while running; settings hot-reload (~1s)
 #include <AudioToolbox/AudioToolbox.h>
+#include <mach-o/dyld.h>
 #include <CoreAudio/CoreAudio.h>
 #include <sys/stat.h>
 #include <atomic>
@@ -34,7 +35,16 @@ struct Engine {
     PEQChannel           peq[kChannels];
     std::atomic<bool>    running{true};
     std::string          confPath;
+    std::mutex cfgMx;                    // cfg 在 IO 热重载线程写、主循环热切换读
     std::shared_ptr<const PEQConfig> cfg;
+    std::shared_ptr<const PEQConfig> getCfg() {
+        std::lock_guard<std::mutex> lk(cfgMx);
+        return cfg;
+    }
+    void setCfg(std::shared_ptr<const PEQConfig> p) {
+        std::lock_guard<std::mutex> lk(cfgMx);
+        cfg = std::move(p);
+    }
     time_t               confMtime  = 0;
     int                  reloadTick = 0;
     AudioDeviceID        virtualDev = kAudioObjectUnknown;
@@ -42,6 +52,8 @@ struct Engine {
     AudioDeviceIOProcID  inProc     = nullptr;
     AudioDeviceIOProcID  outProc    = nullptr;
     shmring::ShmFrameRing* shm      = nullptr;   // spectrum feed for the GUI
+    std::string          curOutputName;          // 当前实际绑定的输出设备名
+    std::atomic<bool>    rebindOutput{false};    // conf 变更 → 主循环里热切换输出设备
     // debug counters
     std::atomic<uint64_t> inCB{0}, inFramesGot{0}, inFramesDropped{0}, outUnderrunFrames{0}, outCB{0};
     std::atomic<float>    inPeak{0.0f}, outPeak{0.0f};
@@ -270,17 +282,130 @@ static OSStatus outputDeviceProc(AudioObjectID /*inDevice*/, const AudioTimeStam
             e->confMtime = st.st_mtime;
             if (auto cfg = loadConfig(e->confPath.c_str(), (int)deviceSampleRate(e->virtualDev))) {
                 for (auto& p : e->peq) p.prepare(cfg, kChannels);
-                fprintf(stderr, "[peq] config reloaded (%zu bands, bypass=%d)\n",
-                        cfg->bands.size(), (int)cfg->bypass);
+                e->setCfg(cfg);
+                fprintf(stderr, "[peq] config reloaded (L=%zu R=%zu lr=%d preamp=%.1f/%.1f bypass=%d)\n",
+                        cfg->bands[0].size(), cfg->bands[1].size(), (int)cfg->lrMode,
+                        cfg->preampDb[0], cfg->preampDb[1], (int)cfg->bypass);
+                if (!cfg->outputName.empty() && cfg->outputName != e->curOutputName)
+                    e->rebindOutput.store(true);   // 主循环里热切换（不在 IO 线程动设备）
             }
         }
     }
     return noErr;
 }
 
+// status file for the GUI (device binding + volume sliders)
+static void writeEngineStatus(const Engine& e, Float64 vRate, Float64 rRate) {
+    std::string dir = ".";
+    const size_t slash = e.confPath.find_last_of('/');
+    if (slash != std::string::npos) dir = e.confPath.substr(0, slash);
+    FILE* sf = fopen((dir + "/engine.status").c_str(), "w");
+    if (sf) {
+        fprintf(sf, "output_name=%s\noutput_rate=%.0f\nvirtual_rate=%.0f\n",
+                deviceName(e.realDev).c_str(), rRate, vRate);
+        fclose(sf);
+    }
+}
+
+// 把 SystemPEQ 标称采样率对齐到目标率：SetProperty 可能返回 noErr 但值未生效
+// （HAL 侧异步/客户端清理时序），所以设置后必须回读验证，失败带间隔重试。
+static bool alignVirtualRate(Engine& e, Float64 want) {
+    AudioObjectPropertyAddress ra = {kAudioDevicePropertyNominalSampleRate,
+                                     kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain};
+    for (int i = 0; i < 5; ++i) {
+        Float64 cur = deviceSampleRate(e.virtualDev);
+        if (std::fabs(cur - want) < 1.0) return true;       // 已一致（含前次生效）
+        Float64 w = want;
+        OSStatus err = AudioObjectSetPropertyData(e.virtualDev, &ra, 0, nullptr, sizeof(w), &w);
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        if (err == noErr && std::fabs(deviceSampleRate(e.virtualDev) - want) < 1.0) return true;
+    }
+    return std::fabs(deviceSampleRate(e.virtualDev) - want) < 1.0;
+}
+
+// conf 的 output_name 变化 → 切换真实输出设备（主循环线程调用，不在 IO 线程动设备）
+//
+// 顺序至关重要：SystemPEQ 标称采样率的重对齐必须在它的 IOProc 停止时做——
+// 设备 IO 运行中 SetProperty(nominal rate) 会被拒绝（启动时能对齐是因为当时 IO 还没起），
+// 拒绝后输入/输出采样率持续失配 = 环形缓冲欠载 = 声音断断续续。
+static void rebindOutputDevice(Engine& e) {
+    auto cfg = e.getCfg();
+    if (!cfg || cfg->outputName.empty()) return;
+    AudioDeviceID nd = findDeviceByName(cfg->outputName);
+    if (nd == kAudioObjectUnknown) {
+        fprintf(stderr, "[peq] output '%s' not found; keeping '%s'\n",
+                cfg->outputName.c_str(),
+                e.realDev != kAudioObjectUnknown ? deviceName(e.realDev).c_str() : "(none)");
+        return;
+    }
+    if (nd == e.realDev) { e.curOutputName = cfg->outputName; return; }
+
+    const AudioDeviceID oldDev = e.realDev;
+    fprintf(stderr, "[peq] switching output: '%s' -> '%s'\n",
+            oldDev != kAudioObjectUnknown ? deviceName(oldDev).c_str() : "(none)",
+            cfg->outputName.c_str());
+
+    // 1. 先停 SystemPEQ 输入（为重对齐采样率腾出条件，也避免切换期间数据失衡）
+    AudioDeviceStop(e.virtualDev, e.inProc);
+    // 2. 停+销毁旧输出（必须在真实设备上做，否则旧回调继续跑、和新回调抢数据）
+    if (oldDev != kAudioObjectUnknown && e.outProc) {
+        AudioDeviceStop(oldDev, e.outProc);
+        AudioDeviceDestroyIOProcID(oldDev, e.outProc);
+        e.outProc = nullptr;
+    }
+
+    // 3. 重对齐 SystemPEQ 标称采样率到新设备（IO 已停，失败则重试）
+    const Float64 rRate = deviceSampleRate(nd);
+    Float64 vRate = deviceSampleRate(e.virtualDev);
+    if (vRate != rRate) {
+        if (alignVirtualRate(e, rRate)) {
+            vRate = deviceSampleRate(e.virtualDev);
+            fprintf(stderr, "[peq] SystemPEQ rate realigned to %.0f Hz\n", vRate);
+        } else {
+            fprintf(stderr, "[peq] WARNING: rate realign failed; expect pitch/drop artifacts\n");
+        }
+    }
+
+    // 4. 绑定并启动新输出；失败则尽力恢复旧设备
+    e.realDev = nd;
+    bool ok = AudioDeviceCreateIOProcID(nd, outputDeviceProc, &e, &e.outProc) == noErr &&
+              AudioDeviceStart(nd, e.outProc) == noErr;
+    if (!ok) {
+        fprintf(stderr, "[peq] ERROR: cannot bind new output; restoring previous\n");
+        e.realDev = oldDev;
+        ok = oldDev != kAudioObjectUnknown &&
+             AudioDeviceCreateIOProcID(oldDev, outputDeviceProc, &e, &e.outProc) == noErr &&
+             AudioDeviceStart(oldDev, e.outProc) == noErr;
+        if (ok) fprintf(stderr, "[peq] restored output '%s'\n", deviceName(oldDev).c_str());
+    }
+
+    // 5. 重启输入（此时输入输出采样率一致，环形缓冲重新平衡）
+    AudioDeviceStart(e.virtualDev, e.inProc);
+
+    if (ok) {
+        e.curOutputName = cfg->outputName;
+        writeEngineStatus(e, vRate, rRate);
+        fprintf(stderr, "[peq] output now '%s' @ %.0f Hz\n", deviceName(e.realDev).c_str(), rRate);
+    }
+}
+
 int main(int argc, char** argv) {
     Engine e;
-    e.confPath = argc > 1 ? argv[1] : "peq.conf";
+    // 默认 conf 路径相对可执行文件定位（engine/build/peq_engine -> engine/peq.conf），
+    // 不受启动目录影响；argv[1] 仍可覆盖
+    {
+        char buf[4096];
+        uint32_t sz = sizeof(buf);
+        std::string def = "peq.conf";
+        if (_NSGetExecutablePath(buf, &sz) == 0) {
+            std::string p = buf;
+            const size_t s1 = p.find_last_of('/');      // .../engine/build
+            const size_t s2 = (s1 == std::string::npos) ? std::string::npos : p.rfind('/', s1 - 1);
+            if (s2 != std::string::npos) def = p.substr(0, s2) + "/peq.conf";   // .../engine/peq.conf
+        }
+        e.confPath = argc > 1 ? argv[1] : def;
+    }
 
     e.virtualDev = findDeviceByName("SystemPEQ 2ch");
     if (e.virtualDev == kAudioObjectUnknown) {
@@ -289,13 +414,26 @@ int main(int argc, char** argv) {
     }
     Float64 vRate = deviceSampleRate(e.virtualDev);
 
-    // ---- pick real output device (interactive unless given via argv[2]) ----
+    // ---- pick real output device: conf output_name > argv[2] > interactive ----
     AudioDeviceID realDev = kAudioObjectUnknown;
+    std::string confOutput;
+    {
+        auto pre = loadConfig(e.confPath.c_str(), (int)vRate);
+        if (pre) confOutput = pre->outputName;
+    }
     if (argc > 2) {
         realDev = findDeviceByName(argv[2]);
         if (realDev == kAudioObjectUnknown) {
             fprintf(stderr, "[peq] output device '%s' not found, showing picker\n", argv[2]);
         }
+    }
+    if (realDev == kAudioObjectUnknown && !confOutput.empty()) {
+        realDev = findDeviceByName(confOutput);
+        if (realDev != kAudioObjectUnknown)
+            fprintf(stderr, "[peq] output device from config: '%s'\n", confOutput.c_str());
+        else
+            fprintf(stderr, "[peq] output device '%s' (from config) not found, showing picker\n",
+                    confOutput.c_str());
     }
     if (realDev == kAudioObjectUnknown)
         realDev = pickOutputDeviceInteractive(e.virtualDev);
@@ -303,60 +441,52 @@ int main(int argc, char** argv) {
         fprintf(stderr, "ERROR: no output device selected\n");
         return 1;
     }
+    e.realDev = realDev;   // 尽早赋值：writeEngineStatus 等下游都依赖它
+    e.curOutputName = deviceName(realDev);
     Float64 rRate = deviceSampleRate(realDev);
     fprintf(stderr, "\n[peq] SystemPEQ @ %.0f Hz  ->  '%s' @ %.0f Hz\n",
             vRate, deviceName(realDev).c_str(), rRate);
 
     // 把 SystemPEQ 标称采样率对齐到真实设备：消除音调偏移和环形缓冲漂移丢帧
     if (vRate != rRate) {
-        AudioObjectPropertyAddress ra = {kAudioDevicePropertyNominalSampleRate,
-                                         kAudioObjectPropertyScopeGlobal,
-                                         kAudioObjectPropertyElementMain};
-        Float64 want = rRate;
-        UInt32 wsz = sizeof(want);
-        OSStatus rerr = AudioObjectSetPropertyData(e.virtualDev, &ra, 0, nullptr, wsz, &want);
-        if (rerr == noErr) {
+        if (alignVirtualRate(e, rRate)) {
             vRate = deviceSampleRate(e.virtualDev);
             fprintf(stderr, "[peq] SystemPEQ nominal rate set to %.0f Hz (matched output)\n", vRate);
         } else {
-            fprintf(stderr, "[peq] WARNING: cannot change SystemPEQ rate to %.0f Hz (err %d)\n", rRate, rerr);
+            fprintf(stderr, "[peq] WARNING: cannot change SystemPEQ rate to %.0f Hz\n", rRate);
         }
     }
 
     // status file for the GUI (device binding + volume sliders)
-    {
-        std::string dir = ".";
-        const size_t slash = e.confPath.find_last_of('/');
-        if (slash != std::string::npos) dir = e.confPath.substr(0, slash);
-        FILE* sf = fopen((dir + "/engine.status").c_str(), "w");
-        if (sf) {
-            fprintf(sf, "output_name=%s\noutput_rate=%.0f\nvirtual_rate=%.0f\n",
-                    deviceName(realDev).c_str(), rRate, vRate);
-            fclose(sf);
-        }
-    }
+    writeEngineStatus(e, vRate, rRate);
     if (vRate != rRate)
         fprintf(stderr, "[peq] WARNING: sample rates differ; expect pitch/speed artifacts\n");
 
     // ---- initial config ----
     struct stat st{};
     if (stat(e.confPath.c_str(), &st) == 0) e.confMtime = st.st_mtime;
-    e.cfg = loadConfig(e.confPath.c_str(), (int)vRate);
-    if (!e.cfg) {
+    e.setCfg(loadConfig(e.confPath.c_str(), (int)vRate));
+    auto initCfg = e.getCfg();
+    if (!initCfg) {
         fprintf(stderr, "[peq] WARNING: %s not found, starting bypass (0 bands)\n", e.confPath.c_str());
         auto bypass = std::make_shared<PEQConfig>();
         bypass->sampleRate = (int)vRate;
-        e.cfg = bypass;
+        e.setCfg(bypass);
+        initCfg = e.getCfg();
     } else {
-        fprintf(stderr, "[peq] loaded %zu bands from %s\n", e.cfg->bands.size(), e.confPath.c_str());
+        fprintf(stderr, "[peq] loaded L=%zu R=%zu bands from %s (lr=%d)\n",
+                initCfg->bands[0].size(), initCfg->bands[1].size(), e.confPath.c_str(),
+                (int)initCfg->lrMode);
     }
-    for (auto& p : e.peq) p.prepare(e.cfg, kChannels);
+    for (auto& p : e.peq) p.prepare(e.getCfg(), kChannels);
 
     // shared-memory spectrum feed for the GUI (best-effort)
     e.shm = shmring::ShmFrameRing::create("/systempeq_audio", kChannels, (uint32_t)vRate, 1 << 16);
     if (!e.shm) fprintf(stderr, "[peq] WARNING: shm create failed, GUI spectrum unavailable\n");
 
     // ---- output: IOProc directly on the chosen real device (no AudioUnit ambiguity) ----
+    // ⚠️ realDev 必须写入 e.realDev：rebind 的停/销毁旧回调都依赖它
+    e.realDev = realDev;
     if (AudioDeviceCreateIOProcID(realDev, outputDeviceProc, &e, &e.outProc) != noErr) {
         fprintf(stderr, "ERROR: cannot create IOProc on output device\n");
         return 1;
@@ -381,6 +511,7 @@ int main(int argc, char** argv) {
     uint64_t lastIn = 0, lastInF = 0, lastOutU = 0, lastOutCB = 0;
     while (e.running) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (e.rebindOutput.exchange(false)) rebindOutputDevice(e);
         uint64_t inCB   = e.inCB.load();
         uint64_t inF    = e.inFramesGot.load();
         uint64_t dropF  = e.inFramesDropped.load();

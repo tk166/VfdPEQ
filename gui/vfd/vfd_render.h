@@ -51,12 +51,14 @@ struct Stop { float t; RgbF c; };
 // 一个主题 = 一组 (强度 -> RGB) 节点。点阵屏的观感几乎全由这张表决定：
 //   低端越暗越"干净"（黑底不发光），高端越泛白越像"过驱动的荧光粉"。
 // 依次单击点阵屏就按这个顺序循环（与 vfd_spectrum.py 的调色板同源的排在最前面）。
-enum class Theme { yellowGreen = 0, deepGreen, blue, pink, orange };
-constexpr int kThemeCount = 5;
+enum class Theme { yellowGreen = 0, deepGreen, blue, pink, white, brightYellow, orange };
+constexpr int kThemeCount = 7;
 
 inline const char* themeName(Theme t) {
     switch (t) {
-        case Theme::yellowGreen: return "yellow-green";
+        case Theme::white:        return "white";
+        case Theme::brightYellow: return "bright-yellow";
+        case Theme::yellowGreen:  return "yellow-green";
         case Theme::deepGreen:   return "deep-green";
         case Theme::blue:        return "blue";
         case Theme::pink:        return "pink";
@@ -67,6 +69,30 @@ inline const char* themeName(Theme t) {
 
 // 想加主题：在 enum、themeName、这里各加一项，kThemeCount +1 即可。
 inline const Stop* stopsTable(Theme t, int& count) {
+    // 白光荧光/白色 LED 点阵（默认主题）：
+    // 灰阶没有色相区分度，必须靠"黑底-亮数据"的大亮度反差重建层次（对齐绿主题结构）：
+    // 背景近黑、结构件弱可见（与绿主题网格的可见度相当）、柱体渐变从暗起步、数据炽白
+    static const Stop kWhite[] = {
+        {0.000f, {0.010f, 0.010f, 0.010f}},
+        {0.030f, {0.040f, 0.040f, 0.040f}},   // 背景底灰：近黑（垫灰是雾的来源）
+        {0.075f, {0.150f, 0.150f, 0.150f}},   // 副网格：弱可见
+        {0.145f, {0.280f, 0.280f, 0.280f}},   // 主网格
+        {0.230f, {0.400f, 0.400f, 0.400f}},   // 轴
+        {0.300f, {0.520f, 0.520f, 0.520f}},
+        {0.450f, {0.720f, 0.720f, 0.720f}},   // 柱体中段快速爬白
+        {0.600f, {0.880f, 0.880f, 0.880f}},
+        {0.800f, {1.000f, 1.000f, 1.000f}},   // 提前满白：抵消暗角/占空比的视觉损耗
+        {1.000f, {1.000f, 1.000f, 1.000f}},
+    };
+    // 亮黄（琥珀 amber VFD）：黑底琥珀渐变，最亮段黄转近白——有色相层次的单色方案
+    static const Stop kBrightYellow[] = {
+        {0.00f, {0.010f, 0.008f, 0.002f}},
+        {0.10f, {0.140f, 0.100f, 0.010f}},
+        {0.30f, {0.420f, 0.300f, 0.020f}},
+        {0.55f, {0.800f, 0.580f, 0.060f}},
+        {0.78f, {1.000f, 0.820f, 0.200f}},
+        {1.00f, {1.000f, 0.970f, 0.750f}},
+    };
     static const Stop kYellowGreen[] = {   // 与 vfd_spectrum.py 的 PHOSPHOR_STOPS 逐项相同
         {0.00f, {0.008f, 0.028f, 0.022f}},
         {0.10f, {0.030f, 0.180f, 0.130f}},
@@ -108,16 +134,17 @@ inline const Stop* stopsTable(Theme t, int& count) {
         {0.78f, {1.000f, 0.720f, 0.360f}},
         {1.00f, {1.000f, 0.930f, 0.820f}},
     };
-    const Stop* table = kYellowGreen;
+    const Stop* table = kWhite;
     switch (t) {
-        case Theme::deepGreen: table = kDeepGreen; break;
-        case Theme::blue:      table = kBlue;      break;
-        case Theme::pink:      table = kPink;      break;
-        case Theme::orange:    table = kOrange;    break;
-        case Theme::yellowGreen:
-        default:               table = kYellowGreen; break;
+        case Theme::brightYellow: table = kBrightYellow; count = 6; break;
+        case Theme::yellowGreen:  table = kYellowGreen;  count = 6; break;
+        case Theme::deepGreen:   table = kDeepGreen;   count = 6; break;
+        case Theme::blue:        table = kBlue;        count = 6; break;
+        case Theme::pink:        table = kPink;        count = 6; break;
+        case Theme::orange:      table = kOrange;      count = 6; break;
+        case Theme::white:
+        default:                 table = kWhite;       count = 9; break;   // ⚠️ 必须与各表节点数一致
     }
-    count = 6;
     return table;
 }
 
@@ -188,6 +215,8 @@ inline const Glyph* fontTable(int& count) {
         {':', {0b000, 0b010, 0b000, 0b010, 0b000}},
         {'/', {0b001, 0b001, 0b010, 0b100, 0b100}},
         {'+', {0b000, 0b010, 0b111, 0b010, 0b000}},
+        {'=', {0b000, 0b111, 0b000, 0b111, 0b000}},
+        {'>', {0b100, 0b010, 0b001, 0b010, 0b100}},
         {'%', {0b101, 0b001, 0b010, 0b100, 0b101}},
         {' ', {0b000, 0b000, 0b000, 0b000, 0b000}},
     };
@@ -351,7 +380,15 @@ public:
         y0 = bandTop_ + i * (kCtlH + 1);
         y1 = y0 + kCtlH - 1;
     }
+    // Preamp + 声道模式行（音量行下方）
+    void preampRowRect(int& y0, int& y1) const {
+        y0 = preampTop_;
+        y1 = y0 + kCtlH - 1;
+    }
     int ctlHeight() const { return kCtlH; }
+    // FR 区顶行 / 频谱区底行（hover 贯穿竖线用）
+    int frTopRow() const { return frTop_; }
+    int specBottomRow() const { return specBottom_; }
 
     void clearDynamic() {
         std::copy(stat_.begin(), stat_.end(), field_.begin());
@@ -489,12 +526,18 @@ public:
         boxBlurCells(persist_, tmp, glow, 1, 0.30f);   // 对应像素域半径 3(≈0.75 格)
         boxBlurCells(persist_, tmp, glow, 2, 0.12f);   // 对应像素域半径 7(≈1.75 格)
 
+        // 白色主题辉光系数：1.05 仅为保留“主题可调辉光”的接口位（视觉上与全强度几乎无差）
+        const float glowK = (theme_ == Theme::white) ? 1.05f : 1.0f;
+
+        // 白主题的辉光/间隙/暗角衰减已移除：lut 低端修复后黑底天然压得住泛光，
+        // 各主题统一走同一渲染路径（之前为对抗 lut 钳位 bug 的补偿不再需要）
+
         rgbOut.resize((size_t)w * h * 3);
         for (int cy = 0; cy < rows_; ++cy) {
             for (int cx = 0; cx < cols_; ++cx) {
                 const size_t ci = (size_t)cy * cols_ + cx;
                 const float base = persist_[ci];
-                const float g = glow[ci];
+                const float g = glow[ci] * glowK;
                 for (int py = 0; py < cell_; ++py) {
                     const int y = cy * cell_ + py;
                     const bool dotRow = (py < dot_);
@@ -566,10 +609,11 @@ private:
         specBottom_ = specTop_ + kSpecSpan - 1;
         plotTop_ = specTop_;
         plotBottom_ = specBottom_;
-        // ---- 控件区（自下而上）：10 行 band + 2 行音量，框高 7，行距 1 ----
+        // ---- 控件区（自下而上）：10 行 band + 1 行 preamp/声道 + 1 行音量 ----
         const int bezelBottom = rows_ - 1;
         bandTop_ = bezelBottom - 2 - kCtlH - (kBandRows - 1) * (kCtlH + 1);
-        volTop_  = bandTop_ - 3 - (kCtlH - 1) - 2 - (kCtlH - 1);
+        preampTop_ = bandTop_ - 2 - kCtlH;
+        volTop_ = preampTop_ - 1 - kCtlH;
         ctlSkipTop_ = volTop_;
         ctlSkipBottom_ = bandTop_ + (kBandRows - 1) * (kCtlH + 1) + kCtlH - 1;
     }
@@ -866,7 +910,7 @@ private:
     static constexpr int kCtlH = 7;               // 控件框高（5 行字形 + 上下各 1 行边距）
     static constexpr int kSpecSpan = 50;          // 频谱子区行数
     int btnRowTop_ = 0;
-    int volTop_ = 0, bandTop_ = 0;
+    int volTop_ = 0, preampTop_ = 0, bandTop_ = 0;
     int ctlSkipTop_ = -1, ctlSkipBottom_ = -1;
 
     std::string title_ = "SPECTRUM", readout1_ = "48000HZ", readout2_ = "32BIT 2CH";
