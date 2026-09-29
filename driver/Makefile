@@ -17,7 +17,8 @@ DEFINES := \
 	-DkManufacturer_Name='"SystemPEQ Project"' \
 	-DkNumber_Of_Channels=2 \
 	-DkDevice_IsHidden=false \
-	-DkDevice2_IsHidden=true
+	-DkDevice2_IsHidden=true \
+	-DDEBUG=1
 
 CFLAGS  := -arch $(ARCH) -bundle -O2 -DNDEBUG \
 	-mmacosx-version-min=12.0 \

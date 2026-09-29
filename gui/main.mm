@@ -22,6 +22,8 @@
 
 #include <CoreAudio/CoreAudio.h>
 #include <mach-o/dyld.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -307,7 +309,7 @@ static void rebuildAnalyzer(int rate) {
     g_meters.prepare((double)rate, mcfg);
     g_appliedRate = rate;
     fprintf(stderr, "[gui] spectrum: %d Hz, FFT %d -> %d bands\n", rate, g_analyzer.fftSize(),
-            g_analyzer.numBands());
+            (int)g_analyzer.numBands());
 }
 
 static void vfdStep(double dt) {
@@ -1038,12 +1040,369 @@ static void drawControlInteractions(double dt) {
     }
 }
 
+// ================================================================ tray
+// 状态栏图标 + driver/engine 生命周期管理（单进程方案）：
+//   左键   显示/隐藏主窗口
+//   右键   Core 总开关（装/卸 driver + 起/停 engine）· Device（off + 系统设备）· 开机启动 · Quit
+//   RAII   engine 进程存在即杀掉、由托盘持有的 NSTask 重新启动；退出时统一收尸
+//          设备失配（output_name 指向的设备消失）→ 清空设备配置回退 off
+static NSStatusItem* g_statusItem = nil;
+static NSTask*       g_engineTask = nil;
+static bool          g_coreBusy = false;
+static bool          g_appTerminating = false;
+static volatile bool g_quitRequested = false;   // 信号置位，帧边界执行退出   // 终止中的回调一律早退（NSStatusItem 已被 teardown）
+
+static void ensureSystemOutputIsPEQ();   // 前置声明（terminationHandler 里调用）
+
+static NSString* projRoot() {
+    const size_t a = g_confPath.find_last_of('/');        // .../engine
+    std::string eng = (a == std::string::npos) ? g_confPath : g_confPath.substr(0, a);
+    const size_t b = eng.find_last_of('/');
+    return [NSString stringWithUTF8String:(b == std::string::npos ? "." : eng.substr(0, b).c_str())];
+}
+
+static bool driverInstalled() {
+    return [[NSFileManager defaultManager] fileExistsAtPath:@"/Library/Audio/Plug-Ins/HAL/SystemPEQ.driver"];
+}
+
+static bool engineAlive() {
+    if (g_engineTask && [g_engineTask isRunning]) return true;
+    return system("pgrep -q -f 'engine/build/peq_engine' 2>/dev/null") == 0;
+}
+
+static void trayUpdateIcon() {
+    if (!g_statusItem || g_appTerminating) return;
+    if (g_coreBusy)                                g_statusItem.button.title = @"◐ EQ";
+    else if (engineAlive())                        g_statusItem.button.title = @"● EQ";
+    else                                           g_statusItem.button.title = @"○ EQ";
+}
+
+// 同步跑一个任务，返回退出码
+static int runTask(NSString* launchPath, NSArray* args) {
+    NSTask* t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:launchPath];
+    t.arguments = args;
+    t.standardInput = [NSFileHandle fileHandleWithNullDevice];
+    t.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+    t.standardError = [NSFileHandle fileHandleWithNullDevice];
+    NSError* err = nil;
+    if (![t launchAndReturnError:&err]) return -1;
+    [t waitUntilExit];
+    return (int)[t terminationStatus];
+}
+
+// driver 装卸：先试 sudo -n（免密白名单），失败再弹系统密码框
+static bool runPrivilegedScript(NSString* scriptPath) {
+    if (runTask(@"/usr/bin/sudo", @[@"-n", scriptPath]) == 0) return true;
+    NSString* oa = [NSString stringWithFormat:@"do shell script \"sh %@\" with administrator privileges",
+                    scriptPath];
+    return runTask(@"/usr/bin/osascript", @[@"-e", oa]) == 0;
+}
+
+static void stopEngineManaged() {
+    if (g_engineTask) {
+        [g_engineTask setTerminationHandler:nil];   // 退出过程中不再派发（防野指针回调）
+        if ([g_engineTask isRunning]) { [g_engineTask terminate]; [g_engineTask waitUntilExit]; }
+        g_engineTask = nil;
+    }
+    system("pkill -f 'engine/build/peq_engine' 2>/dev/null");
+}
+
+static bool startEngineManaged() {
+    stopEngineManaged();                            // RAII：存在就杀掉，由托盘启动
+    NSString* enginePath = [projRoot() stringByAppendingPathComponent:@"engine/build/peq_engine"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:enginePath]) {
+        fprintf(stderr, "[tray] engine binary missing: %s\n", enginePath.UTF8String);
+        return false;
+    }
+    NSTask* t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:enginePath];
+    t.standardInput = [NSFileHandle fileHandleWithNullDevice];    // 非交互：失配时引擎自动退出
+    NSString* logPath = @"/tmp/systempeq_engine.log";
+    if (![[NSFileManager defaultManager] fileExistsAtPath:logPath])
+        [[NSFileManager defaultManager] createFileAtPath:logPath contents:nil attributes:nil];
+    NSFileHandle* log = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    [log truncateFileAtOffset:0];
+    t.standardOutput = log; t.standardError = log;
+    t.terminationHandler = ^(NSTask* task) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_appTerminating) return;
+            const bool wasManaged = (g_engineTask == task);
+            if (wasManaged) g_engineTask = nil;
+            // Core 开启状态下 engine 意外退出（如 coreaudiod 重启后设备枚举延迟）：
+            // 退避自动重启，连续失败 5 次放弃
+            if (wasManaged && !g_coreBusy && driverInstalled()) {
+                static int attempts = 0;
+                if (attempts < 5) {
+                    const int delay = 2 << attempts;              // 2/4/8/16/32 秒
+                    ++attempts;
+                    fprintf(stderr, "[tray] engine exited unexpectedly, restarting in %ds (attempt %d)\n",
+                            delay, attempts);
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay * NSEC_PER_SEC),
+                                   dispatch_get_main_queue(), ^{
+                        if (g_appTerminating || g_coreBusy) return;
+                        if (startEngineManaged()) {
+                            if (engineAlive()) { attempts = 0; ensureSystemOutputIsPEQ(); }
+                        }
+                    });
+                } else {
+                    fprintf(stderr, "[tray] engine restart abandoned after 5 attempts\n");
+                }
+            }
+            trayUpdateIcon();
+        });
+    };
+    NSError* err = nil;
+    if (![t launchAndReturnError:&err]) {
+        fprintf(stderr, "[tray] engine launch failed: %s\n", err.localizedDescription.UTF8String);
+        return false;
+    }
+    g_engineTask = t;
+    fprintf(stderr, "[tray] engine started (pid %d)\n", (int)t.processIdentifier);
+    return true;
+}
+
+static void clearDeviceConfig() {
+    stopEngineManaged();
+    g_conf.outputName.clear();
+    g_dirtySave = true;
+    peqconf::save(g_confPath.c_str(), g_conf);
+    fprintf(stderr, "[tray] device config mismatch -> cleared, off\n");
+    trayUpdateIcon();
+}
+
+// 设备失配 → 清空设备配置回退 off。
+// ⚠️ 去抖：CoreAudio listener 注册时会立即触发一次回调，且启动早期设备枚举
+// 可能不完整——"枚举未就绪"绝不能当成"配置失配"。失配需持续 1.5s 才执行清空。
+static double g_firstMismatchAt = 0;
+static void checkDeviceMismatch() {
+    if (g_conf.outputName.empty()) { g_firstMismatchAt = 0; return; }
+    const double now = ImGui::GetTime();
+    if (findDeviceByName(g_conf.outputName) == kAudioObjectUnknown) {
+        if (g_firstMismatchAt == 0) { g_firstMismatchAt = now; return; }
+        if (now - g_firstMismatchAt < 1.5) return;      // 去抖窗口
+        g_firstMismatchAt = 0;
+        clearDeviceConfig();
+    } else {
+        g_firstMismatchAt = 0;
+    }
+}
+
+// Core ON 的收尾：确保系统默认输出指向 SystemPEQ（卸载 driver 时 macOS 会把默认
+// 输出切走，重装后不会自动切回——不补这一步，整个 EQ 链路的第一环就是断的）
+static void ensureSystemOutputIsPEQ() {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        for (int i = 0; i < 50; ++i) {                      // 最多等 5 秒（驱动重载有延迟）
+            const AudioDeviceID d = findDeviceByName("SystemPEQ 2ch");
+            if (d != kAudioObjectUnknown) {
+                AudioObjectPropertyAddress pa = {kAudioHardwarePropertyDefaultOutputDevice,
+                                                 kAudioObjectPropertyScopeGlobal,
+                                                 kAudioObjectPropertyElementMain};
+                OSStatus err = AudioObjectSetPropertyData(kAudioObjectSystemObject, &pa, 0,
+                                                          nullptr, sizeof(d), &d);
+                fprintf(stderr, "[tray] system default output -> SystemPEQ (%s)\n",
+                        err == noErr ? "ok" : "failed");
+                return;
+            }
+            usleep(100000);
+        }
+        fprintf(stderr, "[tray] SystemPEQ device never appeared; default output unchanged\n");
+    });
+}
+
+static void coreOn() {
+    if (g_coreBusy) return;
+    g_coreBusy = true; trayUpdateIcon();
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        system("pkill -f 'engine/build/peq_engine' 2>/dev/null");   // RAII: 存在就杀
+        bool ok = true;
+        if (!driverInstalled())
+            ok = runPrivilegedScript([projRoot() stringByAppendingPathComponent:@"scripts/install.sh"]);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_appTerminating) return;
+            g_coreBusy = false;
+            if (ok) { startEngineManaged(); ensureSystemOutputIsPEQ(); }
+            else fprintf(stderr, "[tray] core ON aborted (driver install failed)\n");
+            trayUpdateIcon();
+        });
+    });
+}
+
+static void coreOff() {
+    if (g_coreBusy) return;
+    g_coreBusy = true; trayUpdateIcon();
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        stopEngineManaged();
+        bool ok = runPrivilegedScript([projRoot() stringByAppendingPathComponent:@"scripts/uninstall.sh"]);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_appTerminating) return;
+            g_coreBusy = false;
+            fprintf(stderr, "[tray] core OFF (%s)\n", ok ? "driver uninstalled" : "uninstall failed");
+            trayUpdateIcon();
+        });
+    });
+}
+
+static void deviceSelect(NSString* name) {
+    g_conf.outputName = name.UTF8String;
+    g_dirtySave = true;
+    peqconf::save(g_confPath.c_str(), g_conf);      // 立即落盘（不依赖 draw 循环）
+    if (!engineAlive() && !g_coreBusy) startEngineManaged();
+    trayUpdateIcon();
+}
+
+static void deviceOff() {
+    stopEngineManaged();
+    g_conf.outputName.clear();
+    g_dirtySave = true;
+    peqconf::save(g_confPath.c_str(), g_conf);
+    trayUpdateIcon();
+}
+
+static NSString* launchAgentPlist() {
+    return [@"/dev.systempeq.gui.plist" stringByExpandingTildeInPath];
+}
+static bool launchAtLoginOn() {
+    return [[NSFileManager defaultManager] fileExistsAtPath:launchAgentPlist()];
+}
+static void setLaunchAtLogin(bool on) {
+    if (on) {
+        // 一次性写 sudoers 白名单：开机自启场景 driver 装卸免密
+        NSString* cmd = [NSString stringWithFormat:
+            @"echo \"$USER ALL=(root) NOPASSWD: %@/scripts/install.sh, %@/scripts/uninstall.sh\" "
+            @"> /etc/sudoers.d/systempeq && chmod 440 /etc/sudoers.d/systempeq",
+            projRoot(), projRoot()];
+        runTask(@"/usr/bin/osascript",
+                @[[NSString stringWithFormat:@"do shell script \"%@\" with administrator privileges", cmd]]);
+        NSDictionary* d = @{@"Label": @"dev.systempeq.gui",
+                            @"ProgramArguments": @[[projRoot() stringByAppendingPathComponent:@"gui/build/peq_gui"]],
+                            @"RunAtLoad": @YES, @"KeepAlive": @NO};
+        [d writeToFile:launchAgentPlist() atomically:YES];
+        runTask(@"/bin/launchctl", @[@"load", launchAgentPlist()]);
+        fprintf(stderr, "[tray] launch at login: on\n");
+    } else {
+        runTask(@"/bin/launchctl", @[@"unload", launchAgentPlist()]);
+        [[NSFileManager defaultManager] removeItemAtPath:launchAgentPlist() error:nil];
+        fprintf(stderr, "[tray] launch at login: off\n");
+    }
+}
+
+@interface TrayDelegate : NSObject
+- (void)statusClicked;
+- (void)quit;
+- (void)coreOnAction;
+- (void)coreOffAction;
+- (void)deviceOffAction;
+- (void)devicePick:(NSMenuItem*)sender;
+- (void)toggleLogin;
+@end
+@implementation TrayDelegate
+- (void)statusClicked {
+    NSEvent* e = [NSApp currentEvent];
+    if (e && e.type == NSEventTypeRightMouseUp) {
+        NSMenu* m = [[NSMenu alloc] initWithTitle:@"tray"];
+        m.delegate = (id<NSMenuDelegate>)self;
+        NSView* b = g_statusItem.button;
+        const NSPoint screen = [NSEvent mouseLocation];
+        const NSPoint inBtn = NSMakePoint(screen.x - b.window.frame.origin.x,
+                                          screen.y - b.window.frame.origin.y);
+        [m popUpMenuPositioningItem:nil atLocation:inBtn inView:b];
+    } else if (g_window.isVisible) {
+        [g_window orderOut:nil];
+    } else {
+        [g_window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+    }
+}
+- (void)menuNeedsUpdate:(NSMenu*)m {
+    [m removeAllItems];
+    checkDeviceMismatch();                          // 展开菜单即校验失配
+    // Core
+    NSMenuItem* core;
+    if (g_coreBusy) {
+        core = [m addItemWithTitle:@"Core: working…" action:nil keyEquivalent:@""];
+        core.enabled = NO;
+    } else if (engineAlive()) {
+        core = [m addItemWithTitle:@"Stop Core (uninstall driver)" action:@selector(coreOffAction)
+                            keyEquivalent:@""];
+        core.target = self; core.state = NSControlStateValueOn;
+    } else {
+        core = [m addItemWithTitle:@"Start Core (install driver)" action:@selector(coreOnAction)
+                            keyEquivalent:@""];
+        core.target = self;
+    }
+    // Device submenu
+    NSMenuItem* devItem = [m addItemWithTitle:@"Device" action:nil keyEquivalent:@""];
+    NSMenu* dev = [[NSMenu alloc] initWithTitle:@"Device"];
+    devItem.submenu = dev;
+    NSMenuItem* off = [dev addItemWithTitle:@"Off" action:@selector(deviceOffAction) keyEquivalent:@""];
+    off.target = self;
+    off.state = engineAlive() ? NSControlStateValueOff : NSControlStateValueOn;
+    [dev addItem:[NSMenuItem separatorItem]];
+    for (auto d : outputDevices()) {
+        std::string n = deviceName(d);
+        if (n.find("SystemPEQ") != std::string::npos) continue;    // 引擎输入通道，排除
+        NSMenuItem* it = [dev addItemWithTitle:[NSString stringWithUTF8String:n.c_str()]
+                                        action:@selector(devicePick:) keyEquivalent:@""];
+        it.target = self;
+        it.representedObject = [NSString stringWithUTF8String:n.c_str()];
+        it.state = (g_conf.outputName == n && engineAlive()) ? NSControlStateValueOn
+                                                             : NSControlStateValueOff;
+    }
+    [m addItem:[NSMenuItem separatorItem]];
+    NSMenuItem* login = [m addItemWithTitle:@"Launch at Login" action:@selector(toggleLogin)
+                                     keyEquivalent:@""];
+    login.target = self;
+    login.state = launchAtLoginOn() ? NSControlStateValueOn : NSControlStateValueOff;
+    [m addItem:[NSMenuItem separatorItem]];
+    NSMenuItem* q = [m addItemWithTitle:@"Quit" action:@selector(quit) keyEquivalent:@""];
+    q.target = self;
+}
+- (void)coreOnAction  { coreOn(); }
+- (void)coreOffAction { coreOff(); }
+- (void)deviceOffAction { deviceOff(); }
+- (void)devicePick:(NSMenuItem*)sender { deviceSelect(sender.representedObject); }
+- (void)toggleLogin   { setLaunchAtLogin(!launchAtLoginOn()); trayUpdateIcon(); }
+- (void)quit {
+    stopEngineManaged();                            // RAII 收尸：engine 一并停
+    [NSApp terminate:nil];
+}
+@end
+
+static TrayDelegate* g_trayDelegate = nil;
+static void traySetup() {
+    g_trayDelegate = [TrayDelegate new];
+    // ⚠️ MRC：工厂方法返回 autoreleased 对象，必须 retain——否则 autorelease pool
+    // 排空后 g_statusItem 悬垂（SIGINT/teardown 内存复用后必崩，实测打在 NSExtraMIData 上）
+    g_statusItem = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
+    g_statusItem.button.title = @"○ EQ";
+    g_statusItem.button.target = g_trayDelegate;
+    g_statusItem.button.action = @selector(statusClicked);
+    [g_statusItem.button sendActionOn:NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp];
+    trayUpdateIcon();
+    // 设备热插拔监听：任何时候失配 → 清配置回退 off
+    static dispatch_queue_t q;
+    q = dispatch_queue_create("dev.systempeq.audiolistener", nullptr);
+    static AudioObjectPropertyAddress pa = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal,
+                                            kAudioObjectPropertyElementMain};
+    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &pa, q,
+        ^(UInt32, const AudioObjectPropertyAddress*) { checkDeviceMismatch(); });
+}
+
 // ---------------------------------------------------------------- ImGui frame
 static void drawFrame(id<MTLDevice> device) {
     const double now = ImGui::GetTime();
     static double last = 0;
     double dt = (last > 0) ? std::min(now - last, 0.25) : 1.0 / 60.0;
     last = now;
+
+    // 退出走帧边界：teardown 不能与仍在排队的 draw block 交错（会踩坏堆）
+    if (g_quitRequested && !g_appTerminating) {
+        g_appTerminating = true;
+        stopEngineManaged();
+        [NSApp terminate:nil];
+        return;
+    }
 
     vfdStep(dt);
     vfdUploadTexture(device, g_screen, g_screenTex, g_rgb, g_rgba);
@@ -1165,11 +1524,51 @@ static void drawFrame(id<MTLDevice> device) {
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @end
+// 信号 → 主线程优雅退出（走 applicationWillTerminate 的 RAII 收尸：停 engine）。
+// handler 里只做 async-signal-safe 的 write（self-pipe），终止动作由主队列的
+// dispatch source 执行——直接在 handler 里 dispatch_async 会撞上中断点上的
+// 运行时/堆锁导致 SIGSEGV。
+static int g_sigFd[2] = {-1, -1};
+static void guiSignalHandler(int) {
+    if (g_sigFd[1] >= 0) { char c = 1; ssize_t r = write(g_sigFd[1], &c, 1); (void)r; }
+}
+static void guiSignalSetup() {
+    if (pipe(g_sigFd) != 0) return;
+    fcntl(g_sigFd[1], F_SETFL, O_NONBLOCK);
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, g_sigFd[0], 0,
+                                                   dispatch_get_main_queue());
+    dispatch_source_set_event_handler(src, ^{ g_quitRequested = true; });
+    dispatch_resume(src);
+    signal(SIGINT, guiSignalHandler);
+    signal(SIGTERM, guiSignalHandler);
+}
+
 @implementation AppDelegate
-- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app { (void)app; return YES; }
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app { (void)app; return NO; }
+- (void)applicationDidFinishLaunching:(NSNotification*)note {
+    (void)note;
+    guiSignalSetup();
+    traySetup();
+    coreOn();       // 软件运行时默认立马开启（driver 缺失时弹一次密码框）
+}
+- (void)applicationWillTerminate:(NSNotification*)note {
+    (void)note;
+    g_appTerminating = true;
+    stopEngineManaged();    // RAII 收尸
+}
 @end
 
 int main(int argc, const char** argv) {
+    // ---- 单实例保护（flock）：多实例会互杀 engine，托盘语义完全失效 ----
+    static int lockFd = -1;
+    {
+        lockFd = open("/tmp/systempeq_gui.lock", O_RDWR | O_CREAT, 0600);
+        if (lockFd >= 0 && flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+            fprintf(stderr, "[gui] another instance is running, exiting\n");
+            close(lockFd);
+            return 0;
+        }
+    }
     @autoreleasepool {
         if (argc > 1) g_confPath = argv[1];
         resolveProjectPaths();
@@ -1205,6 +1604,7 @@ int main(int argc, const char** argv) {
                                                                   NSWindowStyleMaskClosable
                                                           backing:NSBackingStoreBuffered
                                                             defer:NO];
+        window.releasedWhenClosed = NO;
         window.title = @"SystemPEQ";
         window.contentView = view;
         window.delegate = view;

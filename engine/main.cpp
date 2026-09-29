@@ -408,6 +408,12 @@ int main(int argc, char** argv) {
     }
 
     e.virtualDev = findDeviceByName("SystemPEQ 2ch");
+    // coreaudiod 重启/驱动重载后设备枚举有延迟，重试等待就绪
+    for (int i = 0; i < 10 && e.virtualDev == kAudioObjectUnknown; ++i) {
+        fprintf(stderr, "[peq] SystemPEQ not enumerated yet, retrying (%d/10)...\n", i + 1);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        e.virtualDev = findDeviceByName("SystemPEQ 2ch");
+    }
     if (e.virtualDev == kAudioObjectUnknown) {
         fprintf(stderr, "ERROR: SystemPEQ 2ch device not found. Is the driver installed?\n");
         return 1;
