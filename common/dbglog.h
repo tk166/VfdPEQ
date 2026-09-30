@@ -14,6 +14,7 @@
 
 static volatile int peq_dbg_fd = -1;   // volatile: 阻断编译器对 fd 状态的跨函数消除（O2 下会吞掉整条日志链）
 static const char* peq_dbg_tag = "APP";
+static volatile int peq_dbg_enabled = 1;   // debug: 0 = 日志丢弃（运行时开关，conf 的 debug_logging 字段驱动）
 
 // 初始化：tag 为组件标签（GUI / ENG / DRV）
 // 路径优先级：编译期宏 PEQ_DEBUG_LOG_PATH（驱动用——helper 进程 HOME=/var/root，
@@ -35,10 +36,14 @@ static void peq_dbg_init(const char* tag) {
     peq_dbg_fd = open(target, O_WRONLY | O_APPEND | O_CREAT, 0666);
 }
 
+// 运行时开关（GUI About 复选框驱动）：关闭 = 日志直接丢弃（调用链/时序不变，仅输出静默）
+static void peq_dbg_set_enabled(int enabled) { peq_dbg_enabled = enabled; }   // debug
+
 // 追加一条：`MM-DD HH:MM:SS.mmm [TAG pid] message`
 // noinline+used：防止 O2 把整条日志调用链消除（驱动侧实测 O2 会消掉格式串）
 __attribute__((noinline, used)) static void peq_dbg(const char* fmt, ...) {
     if (peq_dbg_fd < 0) return;
+    if (!peq_dbg_enabled) return;   // debug: 关闭 = 丢弃（行为/时序不变）
     struct timeval tv;
     gettimeofday(&tv, NULL);
     struct tm tm;

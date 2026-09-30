@@ -32,6 +32,7 @@ struct Conf {
     std::vector<Band> ch[2];           // [0]=L, [1]=R (mirror of L in L=R mode)
     int hueIdx = 0;                    // GUI: phosphor theme index (persisted for restarts)
     int rngIdx = 3;                    // GUI: FR y-axis range index (±24dB default)
+    int debugLogging = 0;              // GUI: 1 = 调试日志写 ~/.vfdpeq_gui.debug.log，0 = 丢弃（/dev/null）
 };
 
 inline void trimInPlace(std::string& s) {
@@ -80,6 +81,10 @@ inline Conf load(const char* path) {
             if (sscanf(line + 3, "%d", &v) == 1) c.hueIdx = v;
             continue;
         }
+        if (strncmp(line, "debug_logging", 13) == 0) {
+            int v = 0;
+            if (sscanf(line + 13, "%d", &v) == 1) c.debugLogging = v ? 1 : 0;
+        }
         if (strncmp(line, "rng", 3) == 0) {
             int v = 0;
             if (sscanf(line + 3, "%d", &v) == 1) c.rngIdx = v;
@@ -120,6 +125,7 @@ inline bool save(const char* path, const Conf& c) {
     if (!c.outputName.empty()) fprintf(f, "output_name %s\n", c.outputName.c_str());
     fprintf(f, "hue %d\n", c.hueIdx);
     fprintf(f, "rng %d\n", c.rngIdx);
+    fprintf(f, "debug_logging %d\n", c.debugLogging);
     const int last = c.lrMode ? 1 : 0;
     for (int side = 0; side <= last; ++side) {
         if (c.lrMode) fprintf(f, "channel %s\n", side == 0 ? "L" : "R");

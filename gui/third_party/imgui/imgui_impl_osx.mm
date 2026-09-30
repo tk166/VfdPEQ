@@ -826,6 +826,10 @@ static void ImGui_ImplOSX_AddTrackingArea(NSView* _Nonnull view)
     bd->Monitor = [NSEvent addLocalMonitorForEventsMatchingMask:eventMask
                                                         handler:^NSEvent* _Nullable(NSEvent* event)
     {
+        // debug: 只处理主窗口的事件——本应用其他窗口（About 等）的事件若强行 convert
+        // 到主 view，会造成鼠标事件错位穿透（实测 About 窗口的点击作用到了 VFD 界面）
+        if (event.window != view.window)
+            return event;
         ImGui_ImplOSX_HandleEvent(event, view);
         return event;
     }];

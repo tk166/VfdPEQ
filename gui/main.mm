@@ -104,11 +104,60 @@ static NSWindow* g_window = nil;                 // 导入/导出对话框的 sh
 
 // project paths, resolved relative to the executable (gui/build/peq_gui -> project root)
 static std::string g_statusPath;
+static std::string g_resRoot;       // debug: 资源根（dev=项目根 / bundle=Contents/Resources）
+static std::string g_engineExe;     // debug: 引擎可执行路径（dev=engine/build/peq_engine / bundle=MacOS/VfdPEQengine）
+static std::string g_guiExe;        // debug: GUI 自身路径（LaunchAgent 用）
+static std::string g_driverSrc;     // debug: 驱动 bundle 源（按需安装时拷贝源）
+static bool g_bundleMode = false;
+
 static void resolveProjectPaths() {
     char buf[4096];
     uint32_t sz = sizeof(buf);
     if (_NSGetExecutablePath(buf, &sz) != 0) return;
     std::string p = buf;
+    // debug: 双模式路径——bundle（.app 打包）与开发目录（git checkout）自动适配
+    if (p.find(".app/Contents/MacOS") != std::string::npos) {
+        g_bundleMode = true;
+        const size_t c = p.find(".app/Contents/MacOS");
+        const std::string contents = p.substr(0, c + strlen(".app/Contents"));
+        g_resRoot    = contents + "/Resources";
+        g_engineExe  = contents + "/MacOS/VfdPEQengine";
+        g_guiExe     = p;
+        g_driverSrc  = contents + "/MacOS/VfdPEQ.driver";
+        // conf: ~/.config/vfdpeq/peq.conf（用户批准的配置路径；首次从 Resources 拷贝默认值；
+        // 旧位置 App Support/VfdPEQ 存在则自动迁移一次，老用户无损升级）
+        const char* home = getenv("HOME");
+        std::string cfg  = std::string(home ? home : "/tmp") + "/.config/vfdpeq";
+        g_confPath   = cfg + "/peq.conf";
+        [[NSFileManager defaultManager] createDirectoryAtPath:
+            [NSString stringWithUTF8String:cfg.c_str()]
+            withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString* defConf = [NSString stringWithFormat:@"%s/Resources/vfdpeq.conf", contents.c_str()];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:
+                  [NSString stringWithUTF8String:g_confPath.c_str()]]) {
+            NSError* cerr = nil;
+            BOOL copied = [[NSFileManager defaultManager] copyItemAtPath:defConf
+                                                                  toPath:[NSString stringWithUTF8String:g_confPath.c_str()]
+                                                                   error:&cerr];
+            peq_dbg("bundle conf seed: copy %s (%s)",   // debug
+                    copied ? "ok" : "FAILED", cerr.localizedDescription.UTF8String ?: "-");
+        }
+        g_statusPath = cfg + "/engine.status";
+        // 旧位置迁移：App Support 存在且 ~/.config 没有 → 拷一次（老用户无损升级）
+        NSString* legacy = [NSString stringWithFormat:
+            @"%@/Library/Application Support/VfdPEQ/peq.conf",
+            [NSString stringWithUTF8String:home ?: ""]];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:legacy] &&
+            ![[NSFileManager defaultManager] fileExistsAtPath:
+                  [NSString stringWithUTF8String:g_confPath.c_str()]]) {
+            NSError* merr = nil;
+            [[NSFileManager defaultManager] copyItemAtPath:legacy
+                                                    toPath:[NSString stringWithUTF8String:g_confPath.c_str()]
+                                                     error:&merr];
+            peq_dbg("legacy conf migrated: %s", merr ? "FAILED" : "ok");   // debug
+        }
+        return;
+    }
     const size_t s1 = p.find_last_of('/');          // .../gui/build
     if (s1 == std::string::npos) return;
     const size_t s2 = p.rfind('/', s1 - 1);         // .../gui
@@ -116,8 +165,18 @@ static void resolveProjectPaths() {
     const size_t s3 = p.rfind('/', s2 - 1);         // project root
     if (s3 == std::string::npos) return;
     const std::string root = p.substr(0, s3);
-    g_confPath   = root + "/engine/peq.conf";
-    g_statusPath = root + "/engine/engine.status";
+    g_resRoot    = root;
+    g_engineExe  = root + "/engine/build/peq_engine";
+    g_guiExe     = p;
+    g_driverSrc  = root + "/driver/build/VfdPEQ.driver";
+    // debug: 开发模式也统一 ~/.config/vfdpeq（与打包形态一致，避免双套配置）
+    const char* home = getenv("HOME");
+    std::string cfg = std::string(home ? home : "/tmp") + "/.config/vfdpeq";
+    [[NSFileManager defaultManager] createDirectoryAtPath:
+        [NSString stringWithUTF8String:cfg.c_str()]
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    g_confPath   = cfg + "/peq.conf";
+    g_statusPath = cfg + "/engine.status";
 }
 
 // ---------------------------------------------------------------- CoreAudio helpers
@@ -574,7 +633,8 @@ static void drawCtlSlider(const CtlRect& r, float frac01, const std::string& lab
 // 热区：更新悬停辉光 + 通用拖动量（左/下滑减小，右/上滑增大），返回归一化 d∈约[-1,1]
 // debug: hover 命中追踪
 static const char* g_lastHoverName = "(none)";
-static bool g_mainBeginOk = false;   // debug: Begin 返回值（false = 窗口被 skip，全部交互失效）
+static bool g_mainBeginOk = false;
+static bool g_aboutOpen = false;        // debug: ImGui About 弹窗开关（绕开 AppKit 控件事件链）   // debug: Begin 返回值（false = 窗口被 skip，全部交互失效）
 static bool ctlHotzone(const char* id, const CtlRect& r, CtlGlow& g, double dt, float& dnorm,
                        bool& active) {
     const float c = (float)cellPx();
@@ -1246,8 +1306,8 @@ static bool engineAlive() {
 // debug: 状态栏图标三态（SVG→PNG，template 模式自动适配菜单栏明暗）
 // disconnected=停 / connected-stable=工作中 / performing=切换中（对应原 unicode 🇻🅅🆅）
 static NSImage* trayStatusImage(const char* state) {
-    NSString* rel = [NSString stringWithFormat:@"assets/status-png/vfdpeq-status-%s.png", state];
-    NSString* path = [projRoot() stringByAppendingPathComponent:rel];
+    NSString* path = [NSString stringWithFormat:@"%s/assets/status-png/vfdpeq-status-%s.png",
+                      g_resRoot.c_str(), state];
     NSImage* img = [[NSImage alloc] initWithContentsOfFile:path];
     if (!img) { peq_dbg("status icon missing: %s", state); return nil; }
     img.size = NSMakeSize(18, 18);   // 菜单栏显示尺寸（44px @2x 数据自动高清）
@@ -1327,7 +1387,8 @@ static void stopEngineManaged() {
         if ([g_engineTask isRunning]) { [g_engineTask terminate]; [g_engineTask waitUntilExit]; }
         g_engineTask = nil;
     }
-    system("pkill -f 'engine/build/peq_engine' 2>/dev/null");
+    system("pkill -f 'engine/build/peq_engine' 2>/dev/null");   // dev 模式
+    system("pkill -f 'VfdPEQengine' 2>/dev/null");              // debug: bundle 模式引擎名
     // 引擎状态文件随引擎死亡而失效，删除防止旧 output_name 回灌配置
     NSString* statusPath = [NSString stringWithFormat:@"%s/engine.status",
                             g_confPath.substr(0, g_confPath.find_last_of('/')).c_str()];
@@ -1337,13 +1398,14 @@ static void stopEngineManaged() {
 static bool startEngineManaged() {
     peq_dbg("startEngineManaged: begin");   // debug
     stopEngineManaged();                            // RAII：存在就杀掉，由托盘启动
-    NSString* enginePath = [projRoot() stringByAppendingPathComponent:@"engine/build/peq_engine"];
+    NSString* enginePath = [NSString stringWithUTF8String:g_engineExe.c_str()];
     if (![[NSFileManager defaultManager] fileExistsAtPath:enginePath]) {
         fprintf(stderr, "[tray] engine binary missing: %s\n", enginePath.UTF8String);
         return false;
     }
     NSTask* t = [NSTask new];
     t.executableURL = [NSURL fileURLWithPath:enginePath];
+    t.arguments = @[[NSString stringWithUTF8String:g_confPath.c_str()]];   // debug: conf 路径显式传递（bundle 模式 conf 在 App Support）
     t.standardInput = [NSFileHandle fileHandleWithNullDevice];    // 非交互：失配时引擎自动退出
     NSString* logPath = @"/tmp/vfdpeq_engine.log";
     if (![[NSFileManager defaultManager] fileExistsAtPath:logPath])
@@ -1442,11 +1504,20 @@ static void coreOn() {
     g_coreBusy = true; trayUpdateIcon();
     peq_dbg("coreOn: begin (driverInstalled=%d)", driverInstalled() ? 1 : 0);   // debug
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        system("pkill -f 'engine/build/peq_engine' 2>/dev/null");   // RAII: 存在就杀
+        system("pkill -f 'engine/build/peq_engine' 2>/dev/null");   // dev 模式
+    system("pkill -f 'VfdPEQengine' 2>/dev/null");              // debug: bundle 模式引擎名   // RAII: 存在就杀
         bool ok = true;
-        if (!driverInstalled())
-            ok = runPrivilegedScript([projRoot() stringByAppendingPathComponent:@"scripts/install.sh"],
+        if (!driverInstalled()) {   // debug: 按需安装——/tmp 安装脚本（源=随包 driver bundle）
+            NSString* sh = [NSString stringWithFormat:
+                @"cp -R \"%@\" /Library/Audio/Plug-Ins/HAL/ && "
+                @"chown -R root:wheel /Library/Audio/Plug-Ins/HAL/VfdPEQ.driver && "
+                @"killall coreaudiod 2>/dev/null; true",
+                [NSString stringWithUTF8String:g_driverSrc.c_str()]];   // debug: %@ 需 ObjC 对象（c_str() 会崩）
+            NSString* shPath = @"/tmp/vfdpeq_driver_install.sh";
+            [sh writeToFile:shPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            ok = runPrivilegedScript(shPath,
                 @"VfdPEQ 首次启动：安装音频驱动（VfdPEQ.virtual device）到系统");
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             if (g_appTerminating) return;
             g_coreBusy = false;
@@ -1511,8 +1582,7 @@ static bool launchAtLoginOn() {
 // 反复装卸驱动不再发生，免密装卸无意义——之前会在主线程弹管理员密码框卡死 UI）。
 static void setLaunchAtLogin(bool on) {
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        NSString* exe = [projRoot() stringByAppendingPathComponent:@"gui/build/peq_engine"];
-        NSString* guiExe = [projRoot() stringByAppendingPathComponent:@"gui/build/peq_gui"];
+        NSString* guiExe = [NSString stringWithUTF8String:g_guiExe.c_str()];
         NSString* tmpPlist = @"/tmp/vfdpeq_launchagent.plist";
         NSString* scriptPath = @"/tmp/vfdpeq_launch_toggle.sh";
         NSString* script;
@@ -1522,7 +1592,7 @@ static void setLaunchAtLogin(bool on) {
             // GUI 把 plist 写到 /tmp（进程内可写），privileged script 负责安装到 LaunchAgents
             // + launchctl load——与 install.sh 同模式，低频操作一次密码可接受。
             NSDictionary* d = @{@"Label": @"dev.vfdpeq.gui",
-                                @"ProgramArguments": @[guiExe, @"--launched-by-agent"],
+                                @"ProgramArguments": @[guiExe],
                                 @"RunAtLoad": @YES, @"KeepAlive": @NO,
                                 @"ProcessType": @"Interactive"};
             NSError* werr = nil;
@@ -1539,7 +1609,6 @@ static void setLaunchAtLogin(bool on) {
                 @"cp /tmp/vfdpeq_launchagent.plist \"/Users/%@/Library/LaunchAgents/dev.vfdpeq.gui.plist\" && "
                 @"chown -R \"$USER\" \"/Users/%@/Library/LaunchAgents/dev.vfdpeq.gui.plist\"",
                 NSFullUserName(), NSFullUserName(), NSFullUserName()];
-            (void)exe;
         } else {
             script = [NSString stringWithFormat:
                 @"rm -f \"/Users/%@/Library/LaunchAgents/dev.vfdpeq.gui.plist\" \"/Users/%@/.vfdpeq_login_enabled\"",
@@ -1568,6 +1637,7 @@ static void setLaunchAtLogin(bool on) {
 - (void)devicePick:(NSMenuItem*)sender;
 - (void)devMenuSink:(NSMenuItem*)sender;
 - (void)toggleLogin;
+- (void)showAbout;
 @end
 // debug: NSMenu 模态跟踪会吞掉鼠标 UP 事件的投递路径，ImGui 内部可能残留
 // "按住/路由失效"状态（实测：右键切换后 hover 全灭 + capture 悬空 + 狂点无效）。
@@ -1647,6 +1717,9 @@ static void imguiResetMouseAfterMenu() {
     login.target = self;
     login.state = launchAtLoginOn() ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:[NSMenuItem separatorItem]];
+    NSMenuItem* about = [m addItemWithTitle:@"About" action:@selector(showAbout) keyEquivalent:@""];
+    about.target = self;
+    [m addItem:[NSMenuItem separatorItem]];
     NSMenuItem* q = [m addItemWithTitle:@"Quit" action:@selector(quit) keyEquivalent:@""];
     q.target = self;
 }
@@ -1658,6 +1731,8 @@ static void imguiResetMouseAfterMenu() {
     imguiResetMouseAfterMenu();   // debug
 }
 - (void)toggleLogin   { setLaunchAtLogin(!launchAtLoginOn()); }
+// debug: About——仓库地址 + debug 日志开关（持久化于 conf 的 debug_logging 字段）
+- (void)showAbout { g_aboutOpen = true; }   // debug: ImGui 侧渲染（绕开 AppKit 控件事件链）
 - (void)quit {
     imguiResetMouseAfterMenu();
     // debug: 退出 = 停引擎（驱动常驻保留——卸载触发 coreaudiod churn 死循环，且装卸密码框
@@ -1903,6 +1978,37 @@ static void drawFrame(id<MTLDevice> device) {
     ensureVolumeBindings();
     if (!modalUp) drawControlInteractions(dt);   // sheet 期间冻结热区（见上）
 
+    // debug: About 弹窗（ImGui 模态）——NSButton 在附属窗口点击后 AppKit 进入不可恢复卡死
+    // （实测多轮），ImGui 内管线复用主窗口事件链，绕开 AppKit 控件层。
+    if (g_aboutOpen) {
+        ImGui::OpenPopup("about##vfd");
+        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x / 2 - 140,
+                                       ImGui::GetIO().DisplaySize.y / 2 - 70), ImGuiCond_Appearing);
+        if (ImGui::BeginPopupModal("about##vfd", &g_aboutOpen, ImGuiWindowFlags_AlwaysAutoResize)) {
+            // debug: 仓库跳转——ImGui 层点击（NSWorkspace 打开浏览器，此前 AppKit NSButton
+            // 控件层卡死与 openURL 无关，是控件事件处理层的锅）
+            if (ImGui::Selectable("github.com/tk166/VfdPEQ")) {
+                peq_dbg("about: opening repo URL");   // debug
+                [[NSWorkspace sharedWorkspace] openURL:
+                    [NSURL URLWithString:@"https://github.com/tk166/VfdPEQ"]];
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Open in browser");
+            ImGui::Spacing();
+            bool dbg = g_conf.debugLogging != 0;
+            if (ImGui::Checkbox("Enable Debug Logging File", &dbg)) {
+                g_conf.debugLogging = dbg ? 1 : 0;
+                g_dirtySave = true;
+                peq_dbg_set_enabled(g_conf.debugLogging);
+                peq_dbg("debug logging %s (About)", dbg ? "ON" : "OFF (discarded)");   // debug
+            }
+            ImGui::TextDisabled("logs: ~/.vfdpeq_gui.debug.log");
+            ImGui::Spacing();
+            if (ImGui::Button("Close")) g_aboutOpen = false;
+            ImGui::EndPopup();
+        }
+    }
+
     ImGui::End();
     ImGui::PopStyleVar(2);
 }
@@ -2045,6 +2151,7 @@ int main(int argc, const char** argv) {
         peq_dbg("[boot 3] conf load");   // debug
         resolveProjectPaths();
         g_conf = peqconf::load(g_confPath.c_str());
+        peq_dbg_set_enabled(g_conf.debugLogging);   // debug: conf 的 debug_logging 字段驱动日志开关
         if (g_conf.ch[0].empty())
             for (int i = 0; i < 10; ++i) g_conf.ch[0].push_back(peqconf::Band{});
         if (!g_conf.lrMode) g_conf.ch[1] = g_conf.ch[0];

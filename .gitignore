@@ -1,3 +1,4 @@
+.DS_Store
 engine/build
 driver/build
 gui/build
@@ -5,3 +6,6 @@ gui/build
 *.conf
 *.plist
 *.log
+*.app
+*.dmg
+

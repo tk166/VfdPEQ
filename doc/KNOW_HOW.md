@@ -82,6 +82,9 @@
 
 ---
 
+- **纯菜单栏 app 形态三件套**：`NSApplicationActivationPolicyAccessory`（Dock 隐藏）、窗口 styleMask 去 Closable/Miniaturizable + `standardWindowButton.hidden = YES`（三键隐藏）、状态栏 NSStatusItem 全权控制（左键窗口显隐、右键菜单含 Quit）。Accessory 下窗口仍可成为 key window，键盘输入正常。
+- **NSMenu 模态跟踪吞鼠标 UP**：`popUpMenuPositioningItem` 跟踪会话结束时不投递对应按键的 UP 给 local monitor——`io.MouseDown[k]` 卡在 true。ImGui 的"点击所有权"机制（`MouseDownOwned=false` + `mouse_earliest_down`）会因此持续清除 hovered window（hover 全灭、capture=0、hoveredWin=NULL，mdown 探针实锤）。**修复**：菜单 action 回调（主线程）末尾显式 `io.AddMouseButtonEvent(k, false)`；或检测到路由失效时注入"全键释放 + 鼠标离开/重新进入"事件对强制重算路由（0.5s 自恢复，实测有效）。
+- **窗口 orderOut/orderFront 后**同源问题：窗口显隐切换会丢鼠标事件状态——恢复路径（makeKeyAndOrderFront）后同样做鼠标复位。
 ## 4. 音频 DSP
 
 - **L/R 独立 EQ**：级联状态按 `[channel][band]` 组织（不要 `[band][channel]`——两声道 band 数可不同）；系数表 per-channel，bypass 用"恒等系数"占位最简单（`BiquadCoeffs{}` 默认即直通）。
@@ -121,6 +124,16 @@
 16. **托盘菜单跟踪后的 ImGui 输入残留（待验证）**：NSMenu 跟踪结束后 ImGui 疑似出现鼠标状态残留，症状 = hover 全灭 + `WantCaptureMouse` 悬空为 1（鼠标明明在控件上）。假设修复方向：菜单回调后显式 `io.AddMouseButtonEvent(0,false)` 复位。**尚未验证**——见 BAD_CASES F3 的归因教训：先验证再修。
 17. **boot 探针**：main() 每个关键步骤一条日志（dbglog 直写文件，stderr 重定向到文件会全缓冲不可靠）——启动卡死一步定位。本项目实例：boot 10 后无 11/12 = 卡在 traySetup 的 CoreAudio 调用。
 18. **探针两条纪律**：① 帧级状态探针必须每帧重置（残留值会把"无命中"显示成"命中旧值"，误导归因）；② 给用户的诊断命令要覆盖全部预期行（`grep "mouse: DOWN"` 会漏掉 UP 行，得出"按键卡住"的假象）。
+19. **build 后置验证**：二进制里 `strings` 检查关键字符串（宏条件编译/优化器会静默吞代码或字符串——本项目 DEBUG 宏变化后 "overload error" 串消失被误判为"没编进去"，实际是 Release 语义）。
+20. **Makefile 变量改动不触发重编**：改 DEFINES/CFLAGS 后源文件 mtime 不变则产物陈旧——`rm -rf build && make` 或 touch 源文件。半成品目录还会让后续 make 误判 up-to-date（debug 目标要 `rm -rf` 清理后再构建）。
+21. **osascript prompt 语序（macOS 26）**：`with administrator privileges prompt "..."` 旧语序被解析器拒绝（-2741 "expected identifier"）；正确语序 `with prompt "..." with administrator privileges`（prompt 前置）。中文/全角字符在 prompt 内容中无碍。
+22. **用户身份与 root 身份的 launchctl 不可互换**：privileged(root) shell 里 `launchctl load` 用户 Aqua agent 会永久卡死（上下文混乱）——文件安装（cp/chown）与 load/unload 必须分离：前者 privileged，后者用户身份。
+23. **AppKit 激活循环**：单纯 `activateIgnoringOtherApps` 无法复位 NSMenu 模态会话后的激活状态；完整 `deactivate → activate`（或点击其他 app 再点回）才复位。"点其他窗口再点回能恢复"这类用户观察是定位 AppKit 状态残留的黄金线索。
+24. **ObjC++ 格式符混用是运行时炸弹**：`stringWithFormat` 的 `%@` 接 `c_str()` 裸指针 → `objc_opt_respondsToSelector` 崩溃（EXC_BREAKPOINT），编译器不查。**新分支首跑路径（首装/降级/错误路径）必须专测**——开发模式不踩的雷，打包形态一踩就炸。
+25. **macOS 26 TCC 拒绝应用进程写 ~/Library/LaunchAgents**：`writeToFile` 返回 NO + "You don't have permission"（目录属主可写、无 deny ACL 仍拒）。解法：plist 写 /tmp → privileged script（osascript 一次密码）cp 到目标 + launchctl load。**load/unload 必须用户身份执行**——privileged root shell 里 load 用户 Aqua agent 会永久卡死。
+26. **sample 工具抓任意进程**（root 进程需 osascript 提权）：`sample <pid> 2 -file out.txt`——主线程栈直接指明冻结点。本项目实例：GUI 冻结 = `HALSystem::InitializeDevices()` 的 mach_msg（等 coreaudiod IPC）。
+27. **虚拟音频设备的 TCC 麦克风语义**：打开带 input streams 的音频设备（虚拟设备 EQ 架构的前提）会触发"访问麦克风"弹窗，归属到拉起驱动的用户会话进程。数据来自驱动 ring 而非真实麦克风，允许/拒绝不影响功能。**.app bundle + Info.plist 的 NSMicrophoneUsageDescription 可让弹窗带说明**——裸二进制无法自定义。
+28. **python 批量替换必须断言命中**：`replace()` 未命中时静默跳过——本项目至少两次因替换未命中部署了旧逻辑（privileged 代码、conf seed）而不知道。**每次替换后 assert 关键标记存在于产物中**。
 
 ---
 
@@ -129,12 +142,25 @@
 | 决策 | 选择 | 理由 |
 |---|---|---|
 | 托盘载体 | 单进程复用 GUI（NSStatusItem） | 复用 CoreAudio/conf/日志全套基础设施；引擎本就是独立子进程，隔离性已满足 |
-| 提权 | osascript 密码框 + sudoers 白名单（自启场景） | 零依赖；SMJobBless 样板成本不成比例 |
+| 提权 | osascript 密码框（prompt 前置语序），仅限首次装驱动与 Launch at login 切换 | 零依赖；sudoers 白名单与频繁装卸在驱动常驻架构下已无意义 |
 | 配置 | 单 conf 文件双端解析（引擎+GUI） | 热加载天然同步两端；未知行跳过保证向后兼容 |
 | L/R 状态机 | L=R→L/R 复制 L；L/R→L=R 保留 L | 符合"先分后合"的直觉，合并不丢数据 |
-| 失配策略 | 清空设备配置回退 Off（带 1.5s 去抖） | 状态机无死锁；去抖防"枚举未就绪"误伤 |
-| 退出 | 信号 → 标志 → 帧边界执行 | 避免 teardown 与渲染交错踩堆 |
+| 失配策略 | 引擎自动降级到可用输出（用户意图权威期 3s 内 GUI 不回写） | 声音不断优于回退 Off；权威期防 status 轮询竞态覆盖用户选择 |
+| 退出 | 信号 → self-pipe → 主队列 handler 直接执行（渲染循环停摆也有兜底） | 依赖 drawFrame 消费退出标志在后台窗口场景会永久挂起 |
+| **虚拟设备采样率** | **固定 192kHz 不跟随输出设备；输出侧 Core Audio SRC（AudioConverter 拉取模式）转换到目标 rate** | 消除驱动 nominal rate 反复重设（44.1↔48 翻转）——overload 风暴/IO 卡死/underrun 的共同诱因；SRC 后做 EQ（系数按目标 rate） |
+| **驱动生命周期** | **常驻安装：启动时检测按需安装（一次密码）；托盘 Core 开关只管引擎启停；卸载走 uninstall.sh 手动** | 反复"卸载+killall coreaudiod"是 coreaudiod 对象 churn 死循环的触发序列（实测 140% CPU 全查询悬挂） |
+| **rebind 语义** | 只动输出侧（Stop/Destroy/Create/Start）；输入侧（192k 固定）持续运行 | 输入停启会引发 workloop churn + rb 断流（切换瞬间静默 IO cycles = overload 诱因） |
+| **App 形态** | NSApplicationActivationPolicyAccessory + 窗口无三键 + 状态栏按钮全权控制 | 纯菜单栏 app 标准形态；Dock/三键/退出入口收敛到状态栏 |
+| **状态栏图标** | SVG → Swift NSImage 渲染 PNG（alpha 保留）→ template 模式 | qlmanage 缩略图管线会合成白底丢 alpha；template 让 AppKit 按菜单栏明暗自动反色 |
+| **Launch at login** | plist 写 /tmp → privileged script 安装到 ~/Library/LaunchAgents → launchctl load 由用户身份执行 | macOS 26 TCC 拒绝普通进程直写 LaunchAgents；root shell 里 load 用户 Aqua agent 会永久卡死 |
+| **hover 路由自恢复** | 鼠标在窗口 rect 内但路由不认持续 0.5s → 注入"全键释放 + leave/re-enter"事件对 | NSMenu 模态跟踪吞右键 UP → io.MouseDown[1] 卡住 → ImGui 点击所有权机制持续清除 hovered window（mdown 探针实锤） |
+| **托盘菜单事件补偿** | 菜单 action 回调末尾显式复位鼠标按键状态（AddMouseButtonEvent false） | NSMenu 模态跟踪吞 UP 是系统性行为，action 闭合是可靠的复位时机 |
+| **App bundle 结构** | 主程序+引擎+驱动 bundle 全入 Contents/MacOS；conf/status 在 ~/.config/vfdpeq（用户批准）；Resources 放默认 conf/图标/脚本 | 双模式路径（bundle/开发）自动适配；conf 与 app 分离（卸载/更新不影响用户数据） |
+| **驱动安装方式** | 启动时检测按需安装（/tmp 脚本 + privileged，源=随包 driver bundle）；不再依赖 scripts/install.sh | install.sh 的相对路径在 bundle 内失效；/tmp 脚本可携带任意源路径 |
+| **hover 路由自恢复** | 鼠标在窗口 rect 内但路由不认持续 0.5s → 注入"全键释放 + leave/re-enter"事件对 | 实测规律：路由只在"鼠标从窗口外重新进入"时重算；从菜单栏深处回来时进入失效态且不自恢复 |
+| **About 实现** | ImGui 模态弹窗（主窗口内渲染） | AppKit 独立窗口的 NSButton 点击触发不可恢复的 AppKit 卡死（多控件/多样式/权限变体全部实测）；ImGui 管线复用主窗口事件链免疫此问题 |
+| **仓库/打包工具** | 手写 package.sh（组装+签名+hdiutil DMG）；Swift svg2png（NSImage 渲染，alpha 保留） | qlmanage 缩略图管线合成白底丢 alpha；brew 装工具被沙箱策略拦截；CLT 自带 swiftc 零依赖 |
 
 ---
 
-*整理自 2026-09-29 ～ 09-30 的开发实录（Stage1 → tmp01）。*
+*整理自 2026-09-29 ～ 10-01 的开发实录（Stage1 → tmp03 → 驱动常驻/SRC 架构 → 打包分发）。未关闭项：打包版（/Applications 启动）按启动方式 100% 复现"收不到系统音频"——排查结论指向 coreaudiod 混音器对虚拟设备写入的瞬态状态（系统层），全部排查数据与实验矩阵见 BAD_CASES F14 与日志。*
