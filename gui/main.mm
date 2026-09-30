@@ -17,6 +17,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // debug: popup 栈深访问（hover 失效定位）
 #include "imgui_impl_metal.h"
 #include "imgui_impl_osx.h"
 
@@ -1383,18 +1384,17 @@ static void coreOn() {
     });
 }
 
+// debug: 架构决策（用户批准）——托盘 Core 开关只管引擎启停，驱动常驻安装。
+// 反复"卸载驱动 + killall coreaudiod"是 coreaudiod 对象 churn 死循环的触发序列
+// （实测 140%+ CPU、一切音频查询悬挂）。彻底卸载请手动运行 scripts/uninstall.sh。
 static void coreOff() {
     if (g_coreBusy) return;
     g_coreBusy = true; trayUpdateIcon(); stopDrvLogStream();
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+    dispatch_async(dispatch_get_main_queue(), ^{
         stopEngineManaged();
-        bool ok = runPrivilegedScript([projRoot() stringByAppendingPathComponent:@"scripts/uninstall.sh"]);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (g_appTerminating) return;
-            g_coreBusy = false;
-            fprintf(stderr, "[tray] core OFF (%s)\n", ok ? "driver uninstalled" : "uninstall failed");
-            trayUpdateIcon();
-        });
+        g_coreBusy = false;
+        peq_dbg("coreOff: engine stopped (driver kept installed)");   // debug
+        trayUpdateIcon();
     });
 }
 
@@ -1459,8 +1459,25 @@ static void setLaunchAtLogin(bool on) {
 - (void)coreOffAction;
 - (void)deviceOffAction;
 - (void)devicePick:(NSMenuItem*)sender;
+- (void)devMenuSink:(NSMenuItem*)sender;
 - (void)toggleLogin;
 @end
+// debug: NSMenu 模态跟踪会吞掉鼠标 UP 事件的投递路径，ImGui 内部可能残留
+// "按住/路由失效"状态（实测：右键切换后 hover 全灭 + capture 悬空 + 狂点无效）。
+// 菜单 action 回调（主线程）末尾显式复位鼠标按键状态。
+static void imguiResetMouseAfterMenu() {
+    if (g_appTerminating) return;
+    peq_dbg("mouse-reset executed");   // debug: 验证 NSMenuDidEndTracking 触发
+    ImGuiIO& io = ImGui::GetIO();
+    // debug: NSMenu 模态跟踪会吞掉右键 UP 事件 → io.MouseDown[1] 永久卡在按下状态
+    // → ImGui 的"点击所有权"机制（MouseDownOwned=false + mouse_earliest_down）持续清除
+    // hovered window → hover 全灭。菜单跟踪结束必触发本复位。
+    io.AddMouseButtonEvent(0, false);
+    io.AddMouseButtonEvent(1, false);
+    io.AddMouseButtonEvent(2, false);
+}
+
+
 @implementation TrayDelegate
 - (void)statusClicked {
     NSEvent* e = [NSApp currentEvent];
@@ -1488,11 +1505,11 @@ static void setLaunchAtLogin(bool on) {
         core = [m addItemWithTitle:@"Core: working…" action:nil keyEquivalent:@""];
         core.enabled = NO;
     } else if (engineAlive()) {
-        core = [m addItemWithTitle:@"Stop Core (uninstall driver)" action:@selector(coreOffAction)
+        core = [m addItemWithTitle:@"Stop Core" action:@selector(coreOffAction)
                             keyEquivalent:@""];
         core.target = self; core.state = NSControlStateValueOn;
     } else {
-        core = [m addItemWithTitle:@"Start Core (install driver)" action:@selector(coreOnAction)
+        core = [m addItemWithTitle:@"Start Core" action:@selector(coreOnAction)
                             keyEquivalent:@""];
         core.target = self;
     }
@@ -1524,11 +1541,14 @@ static void setLaunchAtLogin(bool on) {
     q.target = self;
 }
 - (void)coreOnAction  { coreOn(); }
-- (void)coreOffAction { coreOff(); }
-- (void)deviceOffAction { deviceOff(); }
-- (void)devicePick:(NSMenuItem*)sender { deviceSelect(sender.representedObject); }
+- (void)coreOffAction { coreOff(); imguiResetMouseAfterMenu(); }
+- (void)deviceOffAction { deviceOff(); imguiResetMouseAfterMenu(); }
+- (void)devicePick:(NSMenuItem*)sender {
+    deviceSelect(sender.representedObject);
+    imguiResetMouseAfterMenu();   // debug
+}
 - (void)toggleLogin   { setLaunchAtLogin(!launchAtLoginOn()); trayUpdateIcon(); }
-- (void)quit {
+- (void)quit { imguiResetMouseAfterMenu();
     // debug: 退出完整收尸——停 engine + 卸载驱动（Core 语义：托盘退出 = 全部清理）
     g_appTerminating = true;
     stopDrvLogStream();
@@ -1698,13 +1718,46 @@ static void drawFrame(id<MTLDevice> device) {
 
     // debug: hover 命中汇总 + ImGui 窗口状态（2s 限频，鼠标在窗口内才打）
     {
-        const ImGuiIO& mio0 = ImGui::GetIO();
+        ImGuiIO& mio0 = ImGui::GetIO();   // debug: 非 const（AddMousePosEvent 注入需要）
         static double lastHoverLog = 0;
         if (now - lastHoverLog > 2.0 && mio0.MousePos.x > -10000) {
             lastHoverLog = now;
-            peq_dbg("hover: over='%s' capture=%d mouse=(%.0f,%.0f) winHovered=%d beginOk=%d",   // debug
+            const ImVec2 wp = ImGui::GetWindowPos();
+            const ImVec2 ws = ImGui::GetWindowSize();
+            ImGuiContext* g = ImGui::GetCurrentContext();
+            const char* hwName = g->HoveredWindow ? g->HoveredWindow->Name : "NULL";
+            peq_dbg("hover: over='%s' capture=%d mouse=(%.0f,%.0f) winHovered=%d beginOk=%d popups=%d hoveredWin='%s' mdown=%d%d%d",   // debug
                     g_lastHoverName, (int)mio0.WantCaptureMouse, mio0.MousePos.x, mio0.MousePos.y,
-                    (int)ImGui::IsWindowHovered(), (int)g_mainBeginOk);
+                    (int)ImGui::IsWindowHovered(), (int)g_mainBeginOk, (int)g->OpenPopupStack.Size, hwName,
+                    (int)mio0.MouseDown[0], (int)mio0.MouseDown[1], (int)mio0.MouseDown[2]);
+        }
+        // debug: hover 路由自恢复——鼠标在窗口 rect 内但 ImGui 路由不认（托盘 NSMenu
+        // 模态跟踪吞掉右键 UP → ImGui"点击所有权"机制持续清除 hovered window，mdown 探针实锤）。
+        // 修复：每帧检测（0.5s 内触发），注入"全键释放 + 鼠标离开/重新进入"，强制重算窗口路由。
+        {
+            ImGuiIO& mio1 = ImGui::GetIO();
+            const bool mouseInWin = mio1.MousePos.x >= 0 && mio1.MousePos.x < mio1.DisplaySize.x &&
+                                    mio1.MousePos.y >= 0 && mio1.MousePos.y < mio1.DisplaySize.y;
+            static int lostHoverFrames = 0;
+            static bool lostAnnounced = false;
+            if (!ImGui::IsWindowHovered() && mouseInWin) {
+                ++lostHoverFrames;
+                if (lostHoverFrames == 30 && !lostAnnounced) {   // 0.5s（60fps × 30 帧）首次触发打一条
+                    lostAnnounced = true;
+                    peq_dbg("hover lost 0.5s -> reset mouse buttons + leave/re-enter");   // debug
+                }
+                if (lostHoverFrames >= 30) {   // 持续注入直到恢复（每帧事件对，直到路由重算成功）
+                    mio1.AddMouseButtonEvent(0, false);
+                    mio1.AddMouseButtonEvent(1, false);
+                    mio1.AddMouseButtonEvent(2, false);
+                    const ImVec2 cur = mio1.MousePos;
+                    mio1.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                    mio1.AddMousePosEvent(cur.x, cur.y);
+                }
+            } else {
+                lostHoverFrames = 0;
+                lostAnnounced = false;
+            }
         }
     }
     g_lastHoverName = "(none)";   // debug: 每帧重置（防残留误导）
@@ -1860,7 +1913,7 @@ static void guiSignalSetup() {
     (void)note;
     g_appTerminating = true;
     stopDrvLogStream();
-    stopEngineManaged();    // RAII 收尸
+    stopEngineManaged();    // RAII 收尸（驱动常驻保留）
 }
 @end
 

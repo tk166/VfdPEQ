@@ -442,8 +442,9 @@ static void rebindToDevice(Engine& e, AudioDeviceID nd) {
     const AudioDeviceID oldDev = e.realDev;
     peq_dbg("[peq] switching output: '%s' -> '%s'",oldDev != kAudioObjectUnknown ? deviceName(oldDev).c_str() : "(none)", deviceName(nd).c_str());
 
-    // 1. 先停 VfdPEQ 输入（为重对齐采样率腾出条件，也避免切换期间数据失衡）
-    AudioDeviceStop(e.virtualDev, e.inProc);
+    // debug: A1——输入侧（SystemPEQ @192k 固定）在切换期间持续运行，不再 Stop/Start：
+    // ① rate 已固定，无需停启腾位；② rb 持续有数据，输出 Start 无静默 IO cycles
+    // （overload 风暴的诱因）；③ 减少 coreaudiod 的 IO workloop deinit/init 次数。
     // 2. 停+销毁旧输出（必须在真实设备上做，否则旧回调继续跑、和新回调抢数据）
     if (oldDev != kAudioObjectUnknown && e.outProc) {
         AudioDeviceStop(oldDev, e.outProc);
@@ -458,6 +459,10 @@ static void rebindToDevice(Engine& e, AudioDeviceID nd) {
     rebuildConverter(e, rRate);   // debug: SRC converter 按（新的）目标 rate 重建
 
     // 4. 绑定并启动新输出；失败则尽力恢复旧设备
+    // debug: A2——输出 Start 前 rb 水位观测（A1 后输入持续写入，水位应充足；
+    // 若不足说明切换耗时超过 rb 容量，需要扩容或延迟 Start）
+    peq_dbg("[peq] rebind: rb level before output start = %zu frames (~%zu ms @192k)",
+            e.rb.level(), e.rb.level() * 1000 / kVirtualRate);   // debug
     e.realDev = nd;
     bool ok = AudioDeviceCreateIOProcID(nd, outputDeviceProc, &e, &e.outProc) == noErr &&
               AudioDeviceStart(nd, e.outProc) == noErr;
@@ -470,8 +475,7 @@ static void rebindToDevice(Engine& e, AudioDeviceID nd) {
         if (ok) peq_dbg("[peq] restored output '%s'", deviceName(oldDev).c_str());
     }
 
-    // 5. 重启输入（SystemPEQ 固定 192k，SRC 负责到目标 rate 的转换，环形缓冲重新平衡）
-    AudioDeviceStart(e.virtualDev, e.inProc);
+    // debug: A1——输入侧持续运行，无需重启（见上）
 
     if (ok) {
         e.curOutputName = deviceName(e.realDev);

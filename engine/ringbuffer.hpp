@@ -31,6 +31,13 @@ public:
         return n;
     }
 
+    // debug: 当前水位（可读帧数）——rebind 输出 Start 前的安全水位观测
+    size_t level() const {
+        size_t head = head_.load(std::memory_order_relaxed);
+        size_t tail = tail_.load(std::memory_order_acquire);
+        return head - tail;
+    }
+
     // returns number of frames actually read
     size_t read(float* dst, size_t frames) {
         size_t n = 0;
