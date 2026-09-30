@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- macOS 外壳阴影 -->
+    <filter id="mac-drop-shadow" x="-10%" y="-10%" width="125%" height="125%">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#000000" flood-opacity="0.18" />
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000000" flood-opacity="0.08" />
+    </filter>
+
+    <!-- VFD 荧光辉光滤镜 -->
+    <filter id="vfd-phosphor-glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="blur1" />
+      <feGaussianBlur stdDeviation="18" result="blur2" />
+      <feMerge>
+        <feMergeNode in="blur2" />
+        <feMergeNode in="blur1" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <!-- 背景渐变 -->
+    <linearGradient id="mac-white-bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#ECEEF1" />
+    </linearGradient>
+
+    <linearGradient id="vfd-screen-bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#070E0B" />
+      <stop offset="100%" stop-color="#020504" />
+    </linearGradient>
+
+    <!-- 亮绿色方形点阵像素 (大小 34x34，间距 48，圆角 4) -->
+    <rect id="vfd-on-pixel" width="34" height="34" rx="4" fill="#5EFEB8" />
+  </defs>
+
+  <!-- 1. macOS 白底圆角外壳 -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#mac-white-bg)" filter="url(#mac-drop-shadow)" />
+  <rect x="100.5" y="100.5" width="823" height="823" rx="184.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.9" stroke-width="2" />
+
+  <!-- 2. VFD 屏幕面板 -->
+  <rect x="180" y="180" width="664" height="664" rx="120" fill="url(#vfd-screen-bg)" stroke="#17261F" stroke-width="5" />
+
+  <!-- 3. 精确 5x3 点阵字符 V F D -->
+  <!-- 点阵参数：网格步长 dx=48, dy=48；字符间距 2×48=96 -->
+  <!-- 起始坐标计算居中：总宽 11*48 - 14 = 514，X起点 = 255；Y起点 = 398 -->
+  <g filter="url(#vfd-phosphor-glow)" transform="translate(255, 398)">
+    
+    <!-- === 字符 'V' === -->
+    <!-- 行0: x 0 x -->
+    <use href="#vfd-on-pixel" x="0" y="0" />
+    <use href="#vfd-on-pixel" x="96" y="0" />
+    <!-- 行1: x 0 x -->
+    <use href="#vfd-on-pixel" x="0" y="48" />
+    <use href="#vfd-on-pixel" x="96" y="48" />
+    <!-- 行2: x 0 x -->
+    <use href="#vfd-on-pixel" x="0" y="96" />
+    <use href="#vfd-on-pixel" x="96" y="96" />
+    <!-- 行3: x 0 x -->
+    <use href="#vfd-on-pixel" x="0" y="144" />
+    <use href="#vfd-on-pixel" x="96" y="144" />
+    <!-- 行4: 0 x 0 -->
+    <use href="#vfd-on-pixel" x="48" y="192" />
+
+    <!-- === 字符 'F' (偏移量 x = 192) === -->
+    <!-- 行0: x x x -->
+    <use href="#vfd-on-pixel" x="192" y="0" />
+    <use href="#vfd-on-pixel" x="240" y="0" />
+    <use href="#vfd-on-pixel" x="288" y="0" />
+    <!-- 行1: x 0 0 -->
+    <use href="#vfd-on-pixel" x="192" y="48" />
+    <!-- 行2: x x 0 -->
+    <use href="#vfd-on-pixel" x="192" y="96" />
+    <use href="#vfd-on-pixel" x="240" y="96" />
+    <!-- 行3: x 0 0 -->
+    <use href="#vfd-on-pixel" x="192" y="144" />
+    <!-- 行4: x 0 0 -->
+    <use href="#vfd-on-pixel" x="192" y="192" />
+
+    <!-- === 字符 'D' (偏移量 x = 384) === -->
+    <!-- 行0: x x 0 -->
+    <use href="#vfd-on-pixel" x="384" y="0" />
+    <use href="#vfd-on-pixel" x="432" y="0" />
+    <!-- 行1: x 0 x -->
+    <use href="#vfd-on-pixel" x="384" y="48" />
+    <use href="#vfd-on-pixel" x="480" y="48" />
+    <!-- 行2: x 0 x -->
+    <use href="#vfd-on-pixel" x="384" y="96" />
+    <use href="#vfd-on-pixel" x="480" y="96" />
+    <!-- 行3: x 0 x -->
+    <use href="#vfd-on-pixel" x="384" y="144" />
+    <use href="#vfd-on-pixel" x="480" y="144" />
+    <!-- 行4: x x 0 -->
+    <use href="#vfd-on-pixel" x="384" y="192" />
+    <use href="#vfd-on-pixel" x="432" y="192" />
+  </g>
+</svg>

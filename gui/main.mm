@@ -42,6 +42,7 @@
 #include "vfd/vfd_render.h"
 
 // debug: 设备切换权威期与选择回调的前置声明（refreshEngineStatus @L269 先于定义使用）
+static bool g_editFocusQueued = false;   // debug: 双击弹窗打开后自动聚焦+全选
 static double g_confAuthorityUntil = 0.0;
 static void deviceSelect(NSString* name);
 
@@ -596,17 +597,34 @@ static bool ctlHotzone(const char* id, const CtlRect& r, CtlGlow& g, double dt, 
     return hovered;
 }
 
-// 双击弹出数值输入（保留原"double-click to type"能力）
+// 双击弹出数值输入（"double-click to type"）：打开即聚焦+全选，回车（或失焦）确认提交
 // pid 必须每控件唯一（同 band 的 freq/gain/Q 共用 id 会触发 ImGui ID 冲突告警）
 // 注意：InputScalar 不支持 EnterReturnsTrue（1.89+ 会 IM_ASSERT 崩溃），
-// 提交用 IsItemDeactivatedAfterEdit 判定。
-static void ctlEditPopup(const char* pid, float* v, const char* fmt) {
-    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) ImGui::OpenPopup(pid);
+// 提交用 IsItemDeactivatedAfterEdit 判定；SetKeyboardFocusHere 让弹窗打开即处于可输入状态。
+// debug: 确认制——编辑期间 *v 实时变化但【不】回写参数（半成品数值不生效），
+// 回车（或失焦）确认时返回 true，调用方此时才写回。避免逐字符输入污染 EQ
+// （实测打 "134" 的过程中 EQ 依次跳 1→13→134 Hz）。
+static bool ctlEditPopup(const char* pid, float* v, const char* fmt) {
+    bool confirmed = false;
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+        ImGui::OpenPopup(pid);
+        ImGui::SetNextWindowPos(ImGui::GetMousePos(), ImGuiCond_Appearing);   // 弹在鼠标附近
+        g_editFocusQueued = true;                                            // 打开后自动聚焦+全选
+    }
     if (ImGui::BeginPopup(pid)) {
-        ImGui::InputFloat("##in", v, 0, 0, fmt);
-        if (ImGui::IsItemDeactivatedAfterEdit()) ImGui::CloseCurrentPopup();
+        if (g_editFocusQueued) {
+            ImGui::SetKeyboardFocusHere(0);       // 打开即键盘聚焦（可输入）
+            g_editFocusQueued = false;
+        }
+        ImGui::InputFloat("##in", v, 0, 0, fmt, ImGuiInputTextFlags_AutoSelectAll);
+        const bool enter = ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter);
+        if (enter || ImGui::IsItemDeactivatedAfterEdit()) {
+            confirmed = true;                     // 回车（或失焦）= 确认，调用方写回
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::EndPopup();
     }
+    return confirmed;
 }
 
 static const char* typeName(FilterType t) {
@@ -1106,8 +1124,12 @@ static void drawControlInteractions(double dt) {
                 peq_dbg("ui: %s CH band %d freq drag -> %.1f Hz", chTag, i + 1, b.freq);   // debug
             }
             float f = (float)b.freq;
-            ctlEditPopup("editf", &f, "%.1f");
-            if (f > 0 && (double)f != b.freq) { b.freq = f; g_dirtySave = g_frDirty = true; }
+            if (ctlEditPopup("editf", &f, "%.1f")) {   // debug: 确认制——回车才写回
+                if (f > 0 && (double)f != b.freq) {
+                    b.freq = f; g_dirtySave = g_frDirty = true;
+                    peq_dbg("ui: %s CH band %d freq confirmed -> %.1f Hz", chTag, i + 1, b.freq);   // debug
+                }
+            }
         }
         {
             float d; bool act;
@@ -1120,8 +1142,12 @@ static void drawControlInteractions(double dt) {
                 peq_dbg("ui: %s CH band %d gain drag -> %+.2f dB", chTag, i + 1, b.gainDB);   // debug
             }
             float g = (float)b.gainDB;
-            ctlEditPopup("editg", &g, "%.2f");
-            if ((double)g != b.gainDB) { b.gainDB = g; g_dirtySave = g_frDirty = true; }
+            if (ctlEditPopup("editg", &g, "%.2f")) {   // debug: 确认制
+                if ((double)g != b.gainDB) {
+                    b.gainDB = g; g_dirtySave = g_frDirty = true;
+                    peq_dbg("ui: %s CH band %d gain confirmed -> %+.2f dB", chTag, i + 1, b.gainDB);   // debug
+                }
+            }
         }
         {
             float d; bool act;
@@ -1217,12 +1243,51 @@ static bool engineAlive() {
     return g_engineTask && [g_engineTask isRunning];
 }
 
+// debug: 状态栏图标三态（SVG→PNG，template 模式自动适配菜单栏明暗）
+// disconnected=停 / connected-stable=工作中 / performing=切换中（对应原 unicode 🇻🅅🆅）
+static NSImage* trayStatusImage(const char* state) {
+    NSString* rel = [NSString stringWithFormat:@"assets/status-png/vfdpeq-status-%s.png", state];
+    NSString* path = [projRoot() stringByAppendingPathComponent:rel];
+    NSImage* img = [[NSImage alloc] initWithContentsOfFile:path];
+    if (!img) { peq_dbg("status icon missing: %s", state); return nil; }
+    img.size = NSMakeSize(18, 18);   // 菜单栏显示尺寸（44px @2x 数据自动高清）
+    [img setTemplate:YES];              // AppKit 自动按菜单栏明暗反色
+    return [img autorelease];
+}
+static NSImage* trayStatusImageCached(const char* state) {
+    static NSDictionary* cache = nil;
+    if (!cache) {
+        // ⚠️ MRC：@{} 字面量返回 autoreleased 对象，赋给 static 指针不 retain——
+        // pool drain 后 cache 悬垂，状态切换时访问即 doesNotRecognizeSelector 崩溃
+        // （BAD_CASES A8 的复发变体：这次是新增的 status icon cache）。永久缓存显式 retain。
+        NSImage* disconnected     = trayStatusImage("disconnected");
+        NSImage* connectedStable  = trayStatusImage("connected-stable");
+        NSImage* performing       = trayStatusImage("performing");
+        NSDictionary* built = @{ @"disconnected": disconnected ?: [NSNull null],
+                                 @"connected-stable": connectedStable ?: [NSNull null],
+                                 @"performing": performing ?: [NSNull null] };
+        cache = [built retain];   // MRC: app 生命周期缓存，永不释放
+    }
+    NSImage* img = cache[[NSString stringWithUTF8String:state]];
+    return [img isKindOfClass:[NSImage class]] ? img : nil;
+}
+
 static void trayUpdateIcon() {
     if (!g_statusItem || g_appTerminating) return;
-    // unicode V 变体：🅅 工作中 / 🇻 停止 / 🆅 切换中
-    if (g_coreBusy)                                g_statusItem.button.title = @"🆅";
-    else if (engineAlive())                        g_statusItem.button.title = @"🅅";
-    else                                           g_statusItem.button.title = @"🇻";
+    // 状态图标（SVG→PNG 三态）：connected-stable 工作中 / disconnected 停止 / performing 切换中
+    const char* state = g_coreBusy ? "performing" : (engineAlive() ? "connected-stable" : "disconnected");
+    peq_dbg("trayIcon: state=%s", state);   // debug
+    NSImage* img = trayStatusImageCached(state);
+    peq_dbg("trayIcon: img=%p", img);   // debug
+    if (img) {
+        g_statusItem.button.image = img;
+        peq_dbg("trayIcon: image set");   // debug
+        g_statusItem.button.title = @"";
+    } else {
+        const char* fallback = g_coreBusy ? "🆅" : (engineAlive() ? "🅅" : "🇻");   // 图标缺失兜底
+        g_statusItem.button.image = nil;
+        g_statusItem.button.title = [NSString stringWithUTF8String:fallback];
+    }
 }
 
 // 同步跑一个任务，返回退出码
@@ -1239,12 +1304,20 @@ static int runTask(NSString* launchPath, NSArray* args) {
     return (int)[t terminationStatus];
 }
 
-// driver 装卸：先试 sudo -n（免密白名单），失败再弹系统密码框
-static bool runPrivilegedScript(NSString* scriptPath) {
+// driver 装卸等特权操作：先试 sudo -n（免密），失败再弹系统密码框。
+// prompt 为密码框的说明文字（告知用户本次授权的目的）。
+// debug: macOS 26 osascript 语法变化——prompt 必须在 administrator privileges 之前
+// （旧语序 "with administrator privileges prompt ..." 被解析器拒绝 -2741）
+static bool runPrivilegedScript(NSString* scriptPath, NSString* prompt) {
     if (runTask(@"/usr/bin/sudo", @[@"-n", scriptPath]) == 0) return true;
-    NSString* oa = [NSString stringWithFormat:@"do shell script \"sh %@\" with administrator privileges",
-                    scriptPath];
+    NSString* oa = [NSString stringWithFormat:
+        @"do shell script \"sh %@\" with prompt \"%@\" with administrator privileges",
+        scriptPath, prompt];
     return runTask(@"/usr/bin/osascript", @[@"-e", oa]) == 0;
+}
+// 兼容旧调用（默认提示）
+static bool runPrivilegedScript(NSString* scriptPath) {
+    return runPrivilegedScript(scriptPath, @"VfdPEQ needs administrator privileges");
 }
 
 static void stopEngineManaged() {
@@ -1372,7 +1445,8 @@ static void coreOn() {
         system("pkill -f 'engine/build/peq_engine' 2>/dev/null");   // RAII: 存在就杀
         bool ok = true;
         if (!driverInstalled())
-            ok = runPrivilegedScript([projRoot() stringByAppendingPathComponent:@"scripts/install.sh"]);
+            ok = runPrivilegedScript([projRoot() stringByAppendingPathComponent:@"scripts/install.sh"],
+                @"VfdPEQ 首次启动：安装音频驱动（VfdPEQ.virtual device）到系统");
         dispatch_async(dispatch_get_main_queue(), ^{
             if (g_appTerminating) return;
             g_coreBusy = false;
@@ -1425,31 +1499,64 @@ static void deviceOff() {
 }
 
 static NSString* launchAgentPlist() {
-    return [@"/dev.vfdpeq.gui.plist" stringByExpandingTildeInPath];
+    // debug: 用户级 LaunchAgents（privileged 脚本安装到同一位置——路径必须一致，
+    // 上轮曾误写为系统级 /Library/LaunchAgents 导致"已安装却显示 Disabled"）
+    return [@"~/Library/LaunchAgents/dev.vfdpeq.gui.plist" stringByExpandingTildeInPath];
 }
 static bool launchAtLoginOn() {
     return [[NSFileManager defaultManager] fileExistsAtPath:launchAgentPlist()];
 }
+// debug: Launch at login——全部在后台队列执行（主线程/菜单零阻塞）。
+// plist 写标准 ~/Library/LaunchAgents/；sudoers 白名单已移除（驱动常驻架构下
+// 反复装卸驱动不再发生，免密装卸无意义——之前会在主线程弹管理员密码框卡死 UI）。
 static void setLaunchAtLogin(bool on) {
-    if (on) {
-        // 一次性写 sudoers 白名单：开机自启场景 driver 装卸免密
-        NSString* cmd = [NSString stringWithFormat:
-            @"echo \"$USER ALL=(root) NOPASSWD: %@/scripts/install.sh, %@/scripts/uninstall.sh\" "
-            @"> /etc/sudoers.d/vfdpeq && chmod 440 /etc/sudoers.d/vfdpeq",
-            projRoot(), projRoot()];
-        runTask(@"/usr/bin/osascript",
-                @[[NSString stringWithFormat:@"do shell script \"%@\" with administrator privileges", cmd]]);
-        NSDictionary* d = @{@"Label": @"dev.vfdpeq.gui",
-                            @"ProgramArguments": @[[projRoot() stringByAppendingPathComponent:@"gui/build/peq_gui"]],
-                            @"RunAtLoad": @YES, @"KeepAlive": @NO};
-        [d writeToFile:launchAgentPlist() atomically:YES];
-        runTask(@"/bin/launchctl", @[@"load", launchAgentPlist()]);
-        fprintf(stderr, "[tray] launch at login: on\n");
-    } else {
-        runTask(@"/bin/launchctl", @[@"unload", launchAgentPlist()]);
-        [[NSFileManager defaultManager] removeItemAtPath:launchAgentPlist() error:nil];
-        fprintf(stderr, "[tray] launch at login: off\n");
-    }
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        NSString* exe = [projRoot() stringByAppendingPathComponent:@"gui/build/peq_engine"];
+        NSString* guiExe = [projRoot() stringByAppendingPathComponent:@"gui/build/peq_gui"];
+        NSString* tmpPlist = @"/tmp/vfdpeq_launchagent.plist";
+        NSString* scriptPath = @"/tmp/vfdpeq_launch_toggle.sh";
+        NSString* script;
+        if (on) {
+            // debug: macOS 26 安全策略——普通应用进程直接写 ~/Library/LaunchAgents 被 TCC 拒绝
+            // （实测 write:0 "You don't have permission to save the file"，即便目录属主可写）。
+            // GUI 把 plist 写到 /tmp（进程内可写），privileged script 负责安装到 LaunchAgents
+            // + launchctl load——与 install.sh 同模式，低频操作一次密码可接受。
+            NSDictionary* d = @{@"Label": @"dev.vfdpeq.gui",
+                                @"ProgramArguments": @[guiExe, @"--launched-by-agent"],
+                                @"RunAtLoad": @YES, @"KeepAlive": @NO,
+                                @"ProcessType": @"Interactive"};
+            NSError* werr = nil;
+            NSData* data = [NSPropertyListSerialization dataWithPropertyList:d
+                                                                      format:NSPropertyListXMLFormat_v1_0
+                                                                     options:0 error:&werr];
+            if (!data || ![data writeToFile:tmpPlist options:NSDataWritingAtomic error:&werr]) {
+                peq_dbg("launch at login: /tmp plist write failed (%s)",   // debug
+                        werr.localizedDescription.UTF8String ?: "none");
+                return;
+            }
+            script = [NSString stringWithFormat:
+                @"mkdir -p \"/Users/%@/Library/LaunchAgents\" && "
+                @"cp /tmp/vfdpeq_launchagent.plist \"/Users/%@/Library/LaunchAgents/dev.vfdpeq.gui.plist\" && "
+                @"chown -R \"$USER\" \"/Users/%@/Library/LaunchAgents/dev.vfdpeq.gui.plist\"",
+                NSFullUserName(), NSFullUserName(), NSFullUserName()];
+            (void)exe;
+        } else {
+            script = [NSString stringWithFormat:
+                @"rm -f \"/Users/%@/Library/LaunchAgents/dev.vfdpeq.gui.plist\" \"/Users/%@/.vfdpeq_login_enabled\"",
+                NSFullUserName(), NSFullUserName()];
+        }
+        [script writeToFile:scriptPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        const bool privOk = runPrivilegedScript(scriptPath);
+        // debug: load/unload 必须以用户身份执行——privileged(root) shell 里 load
+        // 用户 Aqua agent 会上下文混乱并卡死（实测：脚本永远等不到完成）
+        if (on && privOk) {
+            const int lc = runTask(@"/bin/launchctl", @[@"load", launchAgentPlist()]);
+            peq_dbg("launchctl load exit=%d", lc);   // debug
+        }
+        peq_dbg("launch at login: %s (privileged %s)", on ? "enabled" : "disabled",   // debug
+                privOk ? "ok" : "cancelled");
+        dispatch_async(dispatch_get_main_queue(), ^{ trayUpdateIcon(); });
+    });
 }
 
 @interface TrayDelegate : NSObject
@@ -1494,6 +1601,7 @@ static void imguiResetMouseAfterMenu() {
     } else {
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        imguiResetMouseAfterMenu();   // debug: 窗口 orderOut/orderFront 后复位 ImGui 鼠标状态（同 NSMenu 吞 UP 场景）
     }
 }
 - (void)menuNeedsUpdate:(NSMenu*)m {
@@ -1505,11 +1613,11 @@ static void imguiResetMouseAfterMenu() {
         core = [m addItemWithTitle:@"Core: working…" action:nil keyEquivalent:@""];
         core.enabled = NO;
     } else if (engineAlive()) {
-        core = [m addItemWithTitle:@"Stop Core" action:@selector(coreOffAction)
+        core = [m addItemWithTitle:@"[On] Core" action:@selector(coreOffAction)
                             keyEquivalent:@""];
         core.target = self; core.state = NSControlStateValueOn;
     } else {
-        core = [m addItemWithTitle:@"Start Core" action:@selector(coreOnAction)
+        core = [m addItemWithTitle:@"[Off] Core" action:@selector(coreOnAction)
                             keyEquivalent:@""];
         core.target = self;
     }
@@ -1532,8 +1640,10 @@ static void imguiResetMouseAfterMenu() {
                                                              : NSControlStateValueOff;
     }
     [m addItem:[NSMenuItem separatorItem]];
-    NSMenuItem* login = [m addItemWithTitle:@"Launch at Login" action:@selector(toggleLogin)
-                                     keyEquivalent:@""];
+    NSMenuItem* login = [m addItemWithTitle:(launchAtLoginOn() ? @"[Enabled] Launch at login"
+                                                               : @"[Disabled] Launch at login")
+                                     action:@selector(toggleLogin)
+                              keyEquivalent:@""];
     login.target = self;
     login.state = launchAtLoginOn() ? NSControlStateValueOn : NSControlStateValueOff;
     [m addItem:[NSMenuItem separatorItem]];
@@ -1547,21 +1657,16 @@ static void imguiResetMouseAfterMenu() {
     deviceSelect(sender.representedObject);
     imguiResetMouseAfterMenu();   // debug
 }
-- (void)toggleLogin   { setLaunchAtLogin(!launchAtLoginOn()); trayUpdateIcon(); }
-- (void)quit { imguiResetMouseAfterMenu();
-    // debug: 退出完整收尸——停 engine + 卸载驱动（Core 语义：托盘退出 = 全部清理）
+- (void)toggleLogin   { setLaunchAtLogin(!launchAtLoginOn()); }
+- (void)quit {
+    imguiResetMouseAfterMenu();
+    // debug: 退出 = 停引擎（驱动常驻保留——卸载触发 coreaudiod churn 死循环，且装卸密码框
+    // 与退出流程耦合导致每次 Quit 都要密码）。彻底卸载请手动运行 scripts/uninstall.sh。
     g_appTerminating = true;
     stopDrvLogStream();
     stopEngineManaged();
-    peq_dbg("quit: engine stopped, uninstalling driver");   // debug
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        const bool ok = runPrivilegedScript(
-            [projRoot() stringByAppendingPathComponent:@"scripts/uninstall.sh"]);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            peq_dbg("quit: driver uninstall %s", ok ? "ok" : "failed/cancelled");   // debug
-            [NSApp terminate:nil];
-        });
-    });
+    peq_dbg("quit: engine stopped (driver kept installed)");   // debug
+    [NSApp terminate:nil];
 }
 @end
 
@@ -1740,7 +1845,11 @@ static void drawFrame(id<MTLDevice> device) {
                                     mio1.MousePos.y >= 0 && mio1.MousePos.y < mio1.DisplaySize.y;
             static int lostHoverFrames = 0;
             static bool lostAnnounced = false;
-            if (!ImGui::IsWindowHovered() && mouseInWin) {
+            // debug: 特例排除——按住拖拽时（MouseDown[0] 持续 / ActiveId 存在）ImGui 的
+            // IsWindowHovered 为 false 是正常语义（ActiveId 占用 hover），注入复位事件
+            // 会把 MouseDown[0] 强制置 false，表现为"拖到 0.5s 自动松开"。
+            const bool dragHold = mio0.MouseDown[0] || ImGui::GetActiveID() != 0;   // debug: 按住/拖拽/输入框活动
+            if (!ImGui::IsWindowHovered() && mouseInWin && !dragHold) {
                 ++lostHoverFrames;
                 if (lostHoverFrames == 30 && !lostAnnounced) {   // 0.5s（60fps × 30 帧）首次触发打一条
                     lostAnnounced = true;
@@ -1949,7 +2058,9 @@ int main(int argc, const char** argv) {
         NSApp = [NSApplication sharedApplication];
         AppDelegate* del = [AppDelegate new];
         NSApp.delegate = del;
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        // debug: Accessory——Dock 图标隐藏（用户要求：隐藏托盘图标，只依赖状态栏按钮）。
+        // 窗口显隐/退出全部走状态栏按钮的左键（显隐）与右键（菜单含 Quit）。
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
         peq_dbg("[boot 5] view create");   // debug
         ViewController* vc = [ViewController new];
@@ -1964,13 +2075,15 @@ int main(int argc, const char** argv) {
 
         NSWindow* window = [[NSWindow alloc] initWithContentRect:rect
                                                         styleMask:NSWindowStyleMaskTitled |
-                                                                  NSWindowStyleMaskMiniaturizable |
-                                                                  NSWindowStyleMaskResizable |
-                                                                  NSWindowStyleMaskClosable
+                                                                  NSWindowStyleMaskResizable
                                                           backing:NSBackingStoreBuffered
                                                             defer:NO];
         window.releasedWhenClosed = NO;
         window.title = @"VfdPEQ";
+        // debug: 隐藏左上角红黄绿三键（关闭/最小化/缩放）——窗口显隐只走状态栏按钮
+        [window standardWindowButton:NSWindowCloseButton].hidden = YES;
+        [window standardWindowButton:NSWindowMiniaturizeButton].hidden = YES;
+        [window standardWindowButton:NSWindowZoomButton].hidden = YES;
         window.contentView = view;
         window.delegate = view;
         g_window = window;

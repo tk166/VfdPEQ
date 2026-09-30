@@ -172,6 +172,7 @@ static bool ImGui_ImplOSX_HandleEvent(NSEvent* event, NSView* view);
 - (void)insertText:(id)aString replacementRange:(NSRange)replacementRange
 {
     ImGuiIO& io = ImGui::GetIO();
+    NSLog(@"[insertText] %@", aString);   // debug
 
     NSString* characters;
     if ([aString isKindOfClass:[NSAttributedString class]])
@@ -746,13 +747,20 @@ static bool ImGui_ImplOSX_HandleEvent(NSEvent* event, NSView* view)
 
     if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp)
     {
-        if ([event isARepeat])
-            return io.WantCaptureKeyboard;
-
         int key_code = (int)[event keyCode];
         ImGuiKey key = ImGui_ImplOSX_KeyCodeToImGuiKey(key_code);
         io.AddKeyEvent(key, event.type == NSEventTypeKeyDown);
         io.SetKeyEventNativeData(key, key_code, -1); // To support legacy indexing (<1.87 user code)
+
+        // debug: 修复"InputFloat 里数字/小数点无法输入"——输入框聚焦（WantCaptureKeyboard）
+        // 时 keyDown 被 HandleEvent 标记为已处理，AppKit 的 interpretKeyEvents 文本转换
+        // 被跳过，字符到不了 io。这里直接把按键字符喂给 ImGui（含 shift 变换如 !/@/#）。
+        if (event.type == NSEventTypeKeyDown && io.WantCaptureKeyboard && ![event isARepeat])
+        {
+            NSString* chars = event.characters;
+            if (chars.length > 0)
+                io.AddInputCharactersUTF8(chars.UTF8String);
+        }
 
         return io.WantCaptureKeyboard;
     }
