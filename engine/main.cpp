@@ -56,6 +56,7 @@ struct Engine {
     std::string          curOutputName;          // 当前实际绑定的输出设备名
     std::atomic<bool>    rebindOutput{false};    // conf 变更 → 主循环里热切换输出设备
     std::atomic<bool>    devicesChanged{false};  // CoreAudio 设备列表变化 → 主循环检查失联
+    std::atomic<bool>    confReloadRequested{false};  // debug: IOProc 置位 → 主循环热加载
     std::atomic<time_t>  lastRebindAt{0};        // debug: rebind 完成时间（抑制乒乓：完成后 3s 内跳过失联检查）
     // debug counters
     std::atomic<uint64_t> inCB{0}, inFramesGot{0}, inFramesDropped{0}, outUnderrunFrames{0}, outCB{0};
@@ -584,25 +585,45 @@ int main(int argc, char** argv) {
     signal(SIGINT,  [](int){ stopFlag->store(false); });
     signal(SIGTERM, [](int){ stopFlag->store(false); });
 
-    // debug stats thread
-    uint64_t lastIn = 0, lastInF = 0, lastOutU = 0, lastOutCB = 0;
+    // debug: main loop 0.2s tick — hot-reload + device management all here (non-RT thread)
+    int hbCount = 0;
     while (e.running) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        peq_dbg("heartbeat: inCB=%llu outCB=%llu realDev='%s'", (unsigned long long)e.inCB.load(),   // debug
-                (unsigned long long)e.outCB.load(),
-                e.realDev != kAudioObjectUnknown ? deviceName(e.realDev).c_str() : "(none)");
-        if (e.rebindOutput.exchange(false)) rebindOutputDevice(e);
-        {   // debug: 失联检查（跟随 heartbeat 2s 节奏）
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // ① hot-reload config (IOProc 只置标志，重量级操作在此执行)
+        if (e.confReloadRequested.exchange(false)) {
+            struct stat st{};
+            if (stat(e.confPath.c_str(), &st) == 0 && st.st_mtime != e.confMtime) {
+                e.confMtime = st.st_mtime;
+                peq_dbg("hot-reload: loadConfig begin");   // debug
+                if (auto cfg = loadConfig(e.confPath.c_str(), (int)deviceSampleRate(e.virtualDev))) {
+                    for (auto& p : e.peq) p.prepare(cfg, kChannels);
+                    e.setCfg(cfg);
+                    peq_dbg("hot-reload: config reloaded (L=%zu R=%zu lr=%d preamp=%.1f/%.1f bypass=%d)",
+                            cfg->bands[0].size(), cfg->bands[1].size(), (int)cfg->lrMode,
+                            cfg->preampDb[0], cfg->preampDb[1], (int)cfg->bypass);
+                    if (!cfg->outputName.empty() && cfg->outputName != e.curOutputName) {
+                        peq_dbg("hot-reload: output target changed -> rebind");   // debug
+                        e.rebindOutput.store(true);
+                    }
+                } else {
+                    peq_dbg("hot-reload: loadConfig returned NULL");   // debug
+                }
+            }
+        }
+        // ② 设备失联降级（拔出耳机 → 自动切到可用输出）
         if (e.devicesChanged.exchange(false)) {
-            // 绑定的输出设备失联（拔出）→ 自动降级，保证声音不断
-            // debug: 抑制乒乓——rebind 完成后 3s 内 CoreAudio 枚举可能尚未含新设备，
-            // 此时误判失联会切回旧设备、再触发事件、无限乒乓
             if (time(NULL) - e.lastRebindAt.load() < 3) {
                 peq_dbg("skip lost-device check: within rebind suppression window");   // debug
-            } else if (findDeviceByName(deviceName(e.realDev)) == kAudioObjectUnknown) {
+            } else if (e.realDev != kAudioObjectUnknown &&
+                       findDeviceByName(deviceName(e.realDev)) == kAudioObjectUnknown) {
                 fallbackOutputDevice(e);
             }
-        } }
+        }
+        // ③ rebind（conf 的 output_name 变化 → 引擎热切换输出设备）
+        if (e.rebindOutput.exchange(false)) rebindOutputDevice(e);
+        // ④ heartbeat（每 10 拍 = 2s 一条）+ stats
+        if (++hbCount % 10 != 0) continue;
+        static uint64_t lastIn = 0, lastInF = 0, lastOutU = 0, lastOutCB = 0;
         uint64_t inCB   = e.inCB.load();
         uint64_t inF    = e.inFramesGot.load();
         uint64_t dropF  = e.inFramesDropped.load();
@@ -610,9 +631,8 @@ int main(int argc, char** argv) {
         uint64_t outCBn = e.outCB.load();
         float inPk      = e.inPeak.exchange(0.0f, std::memory_order_relaxed);
         float outPk     = e.outPeak.exchange(0.0f, std::memory_order_relaxed);
-        fprintf(stderr, "[dbg] inCB=%llu(+%llu) frames=%llu(+%llu) drop=%llu underrun=%llu(+%llu) | outCB=%llu(+%llu) peak: in=%.4f out=%.4f\n",
+        peq_dbg("hb: inCB=%llu(+%llu) drop=%llu underrun=%llu(+%llu) | outCB=%llu(+%llu) peak: in=%.4f out=%.4f",
                 (unsigned long long)inCB, (unsigned long long)(inCB - lastIn),
-                (unsigned long long)inF, (unsigned long long)(inF - lastInF),
                 (unsigned long long)dropF,
                 (unsigned long long)outU, (unsigned long long)(outU - lastOutU),
                 (unsigned long long)outCBn, (unsigned long long)(outCBn - lastOutCB),

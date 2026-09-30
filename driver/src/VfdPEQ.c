@@ -4556,11 +4556,6 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         // If mute is one let's just fill the buffer with zeros or if there's no apps outputting audio
         if (gMute_Master_Value || lastOutputSampleTime - inIOBufferFrameSize < inIOCycleInfo->mInputTime.mSampleTime)
         {
-            static SInt64 dbgCount = 0;
-            if (dbgCount++ % 200 == 0)
-                syslog(LOG_NOTICE, "VfdPEQ-DRV: ReadInput CLEAR #%lld lastOut=%.0f inputTime=%.0f mute=%d",   // debug: 驱动日志走 syslog，由托盘 log stream 汇入统一文件
-                       dbgCount, lastOutputSampleTime, inIOCycleInfo->mInputTime.mSampleTime,
-                       gMute_Master_Value);
             // Clear the ioMainBuffer
             vDSP_vclr(ioMainBuffer, 1, inIOBufferFrameSize * kNumber_Of_Channels);
             
@@ -4573,10 +4568,6 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         }
         else
         {
-            static SInt64 dbgCount = 0;
-            if (dbgCount++ % 200 == 0)
-                syslog(LOG_NOTICE, "VfdPEQ-DRV: ReadInput COPY #%lld lastOut=%.0f inputTime=%.0f",   // debug
-                       dbgCount, lastOutputSampleTime, inIOCycleInfo->mInputTime.mSampleTime);
             // Copy the buffers.
             memcpy(ioMainBuffer, gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
             memcpy((Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, gRingBuffer, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
@@ -4610,12 +4601,6 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         // Save the last output time.
         lastOutputSampleTime = inIOCycleInfo->mOutputTime.mSampleTime + inIOBufferFrameSize;
         isBufferClear = false;
-        {
-            static SInt64 dbgCount = 0;
-            if (dbgCount++ % 200 == 0)
-                syslog(LOG_NOTICE, "VfdPEQ-DRV: WriteMix #%lld outputTime=%.0f frames=%u",   // debug
-                       dbgCount, inIOCycleInfo->mOutputTime.mSampleTime, inIOBufferFrameSize);
-        }
     }
 
 Done:

@@ -1190,9 +1190,11 @@ static bool driverInstalled() {
     return [[NSFileManager defaultManager] fileExistsAtPath:@"/Library/Audio/Plug-Ins/HAL/VfdPEQ.driver"];
 }
 
+// debug: 引擎存活只查托盘管理的 NSTask——system("pgrep ...") 的 fork+exec+wait
+// 在主线程被频繁调用（trayUpdateIcon/menuNeedsUpdate/deviceSelect），是 UI 卡死的根源。
+// RAII 语义下托盘是唯一管理者：外部 engine 会被 pkill 后由 NSTask 重启，无需检测。
 static bool engineAlive() {
-    if (g_engineTask && [g_engineTask isRunning]) return true;
-    return system("pgrep -q -f 'engine/build/peq_engine' 2>/dev/null") == 0;
+    return g_engineTask && [g_engineTask isRunning];
 }
 
 static void trayUpdateIcon() {
@@ -1562,15 +1564,19 @@ static void stopDrvLogStream() {
 
 static TrayDelegate* g_trayDelegate = nil;
 static void traySetup() {
+    fprintf(stderr, "[boot 10.1] delegate\n");
     g_trayDelegate = [TrayDelegate new];
     // ⚠️ MRC：工厂方法返回 autoreleased 对象，必须 retain——否则 autorelease pool
     // 排空后 g_statusItem 悬垂（SIGINT/teardown 内存复用后必崩，实测打在 NSExtraMIData 上）
+    fprintf(stderr, "[boot 10.2] statusItem\n");
     g_statusItem = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
     g_statusItem.button.title = @"🇻";
     g_statusItem.button.target = g_trayDelegate;
     g_statusItem.button.action = @selector(statusClicked);
     [g_statusItem.button sendActionOn:NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp];
+    fprintf(stderr, "[boot 10.3] trayUpdateIcon\n");
     trayUpdateIcon();
+    fprintf(stderr, "[boot 10.4] listener\n");
     // 设备热插拔监听：任何时候失配 → 清配置回退 off
     static dispatch_queue_t q;
     q = dispatch_queue_create("dev.vfdpeq.audiolistener", nullptr);
@@ -1579,8 +1585,10 @@ static void traySetup() {
                                             kAudioObjectPropertyElementMain};
     AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &pa, q,
         ^(UInt32, const AudioObjectPropertyAddress*) {
+            // debug: 回调只置标志——CoreAudio 注册时立即触发首回调，若在回调里 dispatch
+            // CoreAudio 枚举会与注册线程的内部锁死锁（实测启动卡死在 listener 注册）。
+            // 缓存刷新由 drawFrame 的节流检查消费标志时发起。
             g_devicesChangedFlag = true;
-            refreshDeviceCacheAsync();   // debug: 后台刷新设备缓存
         });
 }
 
@@ -1691,6 +1699,7 @@ static void drawFrame(id<MTLDevice> device) {
     if (g_devicesChangedFlag && now - g_lastDeviceCheck > 1.0) {
         g_devicesChangedFlag = false;
         g_lastDeviceCheck = now;
+        refreshDeviceCacheAsync();   // debug: 后台刷新设备缓存（主线程零 CoreAudio）
         checkDeviceMismatch();
     }
 
@@ -1802,10 +1811,14 @@ static void guiSignalSetup() {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app { (void)app; return NO; }
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
     (void)note;
+    peq_dbg("[boot 9] didFinishLaunching");   // debug
     guiSignalSetup();
     peq_dbg("signal handlers installed (SIGINT/SIGTERM -> self-pipe + engine kill)");   // debug
+    peq_dbg("[boot 10] traySetup");   // debug
     traySetup();
+    peq_dbg("[boot 11] refreshDeviceCache");   // debug
     refreshDeviceCacheAsync();
+    peq_dbg("[boot 12] coreOn");   // debug
     coreOn();       // 软件运行时默认立马开启（driver 缺失时弹一次密码框）
 }
 - (void)applicationWillTerminate:(NSNotification*)note {
@@ -1817,7 +1830,8 @@ static void guiSignalSetup() {
 @end
 
 int main(int argc, const char** argv) {
-    peq_dbg_init("GUI");   // debug
+    peq_dbg_init("GUI");
+    peq_dbg("[boot 1] dbglog init");   // debug
     // ---- 单实例保护（flock）：多实例会互杀 engine，托盘语义完全失效 ----
     static int lockFd = -1;
     {
@@ -1828,8 +1842,10 @@ int main(int argc, const char** argv) {
             return 0;
         }
     }
+    peq_dbg("[boot 2] flock");   // debug
     @autoreleasepool {
         if (argc > 1) g_confPath = argv[1];
+        peq_dbg("[boot 3] conf load");   // debug
         resolveProjectPaths();
         g_conf = peqconf::load(g_confPath.c_str());
         if (g_conf.ch[0].empty())
@@ -1841,11 +1857,13 @@ int main(int argc, const char** argv) {
                 g_conf.ch[0].size(), g_conf.ch[1].size(), g_confPath.c_str(), (int)g_conf.lrMode,
                 (int)g_conf.bypass, g_conf.preampDb[0], g_conf.preampDb[1]);
 
+        peq_dbg("[boot 4] NSApp");   // debug
         NSApp = [NSApplication sharedApplication];
         AppDelegate* del = [AppDelegate new];
         NSApp.delegate = del;
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
+        peq_dbg("[boot 5] view create");   // debug
         ViewController* vc = [ViewController new];
         NSRect rect = NSMakeRect(0, 0, 680, 750);
         AppView* view = [[AppView alloc] initWithFrame:rect];
@@ -1868,10 +1886,12 @@ int main(int argc, const char** argv) {
         window.contentView = view;
         window.delegate = view;
         g_window = window;
+        peq_dbg("[boot 6] window show");   // debug
         [window center];
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 
+        peq_dbg("[boot 7] imgui init");   // debug
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
@@ -1893,6 +1913,7 @@ int main(int argc, const char** argv) {
         ImGui_ImplMetal_Init(view.device);
         ImGui_ImplOSX_Init(view);
 
+        peq_dbg("[boot 8] NSApp run");   // debug
         [NSApp run];
     }
     return 0;
