@@ -3,3 +3,5 @@ driver/build
 gui/build
 *.status
 *.conf
+*.plist
+*.log

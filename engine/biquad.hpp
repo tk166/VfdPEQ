@@ -1,4 +1,4 @@
-// SystemPEQ engine — RBJ cookbook biquad cascade
+// VfdPEQ engine — RBJ cookbook biquad cascade
 #pragma once
 #include <cmath>
 #include <vector>

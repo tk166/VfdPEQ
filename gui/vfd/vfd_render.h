@@ -272,7 +272,7 @@ public:
         buildStatic();
     }
 
-    // ---- FR 模式扩展（SystemPEQ）-------------------------------------------
+    // ---- FR 模式扩展（VfdPEQ）-------------------------------------------
     // frMode_: 0dB 居中的对称 dB 轴 + 左侧 dB 标签（用于画 EQ 频响曲线）
     void configureFr(bool on) {
         if (frMode_ == on) return;
@@ -302,7 +302,7 @@ public:
         return (std::log10(std::max(f, 1e-6f)) - lo) / (hi - lo);
     }
 
-    // ---- 组合屏模式（SystemPEQ）：顶部声量计 + 中部 FR 曲线 + 底部频谱，共享频率轴 ----
+    // ---- 组合屏模式（VfdPEQ）：顶部声量计 + 中部 FR 曲线 + 底部频谱，共享频率轴 ----
     void configureDual(bool on) {
         if (dualMode_ == on) return;
         dualMode_ = on;
@@ -331,7 +331,7 @@ public:
         cell = std::max(cell, val);
     }
 
-    // ---- 控件区绘制原语（SystemPEQ）：写动态层 field_，与 drawBars 同层 max 合成 ----
+    // ---- 控件区绘制原语（VfdPEQ）：写动态层 field_，与 drawBars 同层 max 合成 ----
     // 控件（音量条/PEQ 滑条/按钮）每帧由调用方重画：框 + 滑块 + 点阵文字 + 悬停辉光。
     void dotDyn(int x, int y, float v) {
         if (x < 0 || x >= cols_ || y < 0 || y >= rows_) return;

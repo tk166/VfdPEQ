@@ -1,4 +1,4 @@
-// SystemPEQ GUI — Dear ImGui (Metal) + 全点阵 VFD 界面
+// VfdPEQ GUI — Dear ImGui (Metal) + 全点阵 VFD 界面
 //
 //   整个 UI 是一块点阵大屏（图形区 + 控件区同屏等宽）：
 //     顶部   L/R 声量计
@@ -23,6 +23,8 @@
 #include <CoreAudio/CoreAudio.h>
 #include <mach-o/dyld.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 #include <chrono>
 #include <cmath>
@@ -35,6 +37,7 @@
 #include "../common/peq_conf.hpp"
 #include "../common/shm_ring.hpp"
 #include "vfd/vfd_dsp.h"
+#include "../common/dbglog.h"   // debug
 #include "vfd/vfd_render.h"
 
 // ---------------------------------------------------------------- state
@@ -90,6 +93,7 @@ static ImVec2  g_imgOrigin;                      // 点阵屏在窗口中的位�
 static const float kFrRanges[] = {6, 12, 18, 24, 36};
 static int g_frRangeIdx = 3;                     // 默认 ±24dB（conf 持久化）
 static int g_themeIdx = 0;                       // 磷光主题索引（conf 持久化）
+static double g_deviceSwitchingUntil = 0;        // debug: 设备切换进行中的乐观 UI 窗口
 static NSWindow* g_window = nil;                 // 导入/导出对话框的 sheet 挂靠窗口
 
 // project paths, resolved relative to the executable (gui/build/peq_gui -> project root)
@@ -111,7 +115,15 @@ static void resolveProjectPaths() {
 }
 
 // ---------------------------------------------------------------- CoreAudio helpers
+// debug: CoreAudio 设备缓存——主线程零 CoreAudio 枚举调用（设备变化期 CoreAudio 内部锁
+// 会让枚举调用秒级阻塞主线程，导致鼠标点击全部丢失）。缓存由后台队列刷新。
+struct CachedDevice { AudioDeviceID id; std::string name; };
+static std::vector<CachedDevice> g_devCache;
+static bool g_devCacheValid = false;
+static void refreshDeviceCacheAsync();
+
 static std::string deviceName(AudioDeviceID d) {
+    for (auto& c : g_devCache) if (c.id == d) return c.name;
     AudioObjectPropertyAddress pa = {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
                                      kAudioObjectPropertyElementMain};
     CFStringRef cfn = nullptr;
@@ -145,9 +157,10 @@ static std::vector<AudioDeviceID> outputDevices() {
     return out;
 }
 
+// debug: 设备查找走缓存（主线程零 CoreAudio 枚举），缓存由 refreshDeviceCacheAsync 后台刷新
 static AudioDeviceID findDeviceByName(const std::string& name) {
-    for (auto d : outputDevices())
-        if (deviceName(d) == name) return d;
+    for (auto& d : g_devCache)
+        if (d.name == name) return d.id;
     return kAudioObjectUnknown;
 }
 
@@ -250,6 +263,12 @@ static void refreshEngineStatus() {
         }
     }
     fclose(f);
+    // 引擎实际绑定与配置不一致（引擎失联自动降级后）→ 配置跟随引擎实际状态
+    if (!outName.empty() && outName != g_conf.outputName && g_conf.outputName != "OFF") {
+        g_conf.outputName = outName;
+        g_dirtySave = true;
+        fprintf(stderr, "[gui] output device config synced to engine: '%s'\n", outName.c_str());
+    }
     if (!outName.empty() && outName != g_outCtl.name) {
         AudioDeviceID d = findDeviceByName(outName);
         fprintf(stderr, "[gui] engine.status: '%s' -> dev=0x%x\n", outName.c_str(), d);
@@ -262,17 +281,57 @@ static void refreshEngineStatus() {
     }
 }
 
-// device binding + volume polling（无 UI；由 drawFrame 周期调用）
+// device binding + volume polling
+// debug: CoreAudio 读取全部在后台队列执行——设备变化期 CoreAudio 内部锁会让主线程的
+// 枚举调用秒级阻塞，主线程阻塞窗口内的鼠标点击会全部丢失（实测"拔设备后 UI 长时间
+// 不响应鼠标"）。结果通过主队列 block 应用，DevCtl 仅主线程读写，无需锁。
+struct VolSnapshot { bool inHas, outHas, inMuted, outMuted; float inVol, outVol;
+                     AudioDeviceID inDev, outDev; bool inRebound, outRebound; };
+
+static void pollAudioStateAsync() {
+    static std::atomic<bool> busy{false};
+    bool expect = false;
+    if (!busy.compare_exchange_strong(expect, true)) return;   // 上一轮未完成则跳过
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        VolSnapshot snap{};
+        snap.inDev = g_inCtl.dev; snap.outDev = g_outCtl.dev;
+        if (g_inCtl.dev != kAudioObjectUnknown) {
+            snap.inHas = getVolumeScalar(g_inCtl.dev, snap.inVol);
+            if (!snap.inHas) {                                   // 睡眠唤醒后设备 ID 变化 → 按名字重绑
+                const AudioDeviceID nd = findDeviceByName(g_inCtl.name);
+                if (nd != kAudioObjectUnknown) { g_inCtl.dev = nd; snap.inHas = getVolumeScalar(nd, snap.inVol); snap.inRebound = true; }
+            }
+            snap.inMuted = isMuted(g_inCtl.dev);
+        }
+        if (g_outCtl.dev != kAudioObjectUnknown) {
+            snap.outHas = getVolumeScalar(g_outCtl.dev, snap.outVol);
+            if (!snap.outHas) {
+                const AudioDeviceID nd = findDeviceByName(g_outCtl.name);
+                if (nd != kAudioObjectUnknown) { g_outCtl.dev = nd; snap.outHas = getVolumeScalar(nd, snap.outVol); snap.outRebound = true; }
+            }
+            snap.outMuted = isMuted(g_outCtl.dev);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            busy.store(false);
+            g_inCtl.has = snap.inHas; g_inCtl.vol = snap.inVol; g_inCtl.muted = snap.inMuted;
+            if (snap.inRebound) g_inCtl.dev = snap.inDev;
+            g_outCtl.has = snap.outHas; g_outCtl.vol = snap.outVol; g_outCtl.muted = snap.outMuted;
+            if (snap.outRebound) g_outCtl.dev = snap.outDev;
+            if (snap.outMuted) g_outCtl.vol = 0.0f;
+        });
+    });
+}
+
 static void ensureVolumeBindings() {
     static bool inLogged = false;
     if (g_inCtl.dev == kAudioObjectUnknown) {
-        g_inCtl.dev = findDeviceByName("SystemPEQ 2ch");
-        g_inCtl.name = "SystemPEQ 2ch";
+        g_inCtl.dev = findDeviceByName("VfdPEQ 2ch");
+        g_inCtl.name = "VfdPEQ 2ch";
         if (g_inCtl.dev != kAudioObjectUnknown) {
             g_inCtl.has = getVolumeScalar(g_inCtl.dev, g_inCtl.vol);
             if (!inLogged) {
                 inLogged = true;
-                fprintf(stderr, "[gui] IN bind: dev=0x%x has=%d vol=%.2f\n",
+                peq_dbg("IN bind: dev=0x%x has=%d vol=%.2f",   // debug
                         g_inCtl.dev, (int)g_inCtl.has, g_inCtl.vol);
             }
         }
@@ -287,15 +346,7 @@ static void ensureVolumeBindings() {
     }
     if (ImGui::GetTime() - g_lastVolPoll > 0.5 && !g_volEditing) {
         g_lastVolPoll = ImGui::GetTime();
-        if (g_inCtl.dev != kAudioObjectUnknown) {
-            g_inCtl.has = getVolumeScalar(g_inCtl.dev, g_inCtl.vol);
-            g_inCtl.muted = isMuted(g_inCtl.dev);
-        }
-        if (g_outCtl.dev != kAudioObjectUnknown) {
-            g_outCtl.has = getVolumeScalar(g_outCtl.dev, g_outCtl.vol);
-            g_outCtl.muted = isMuted(g_outCtl.dev);
-            if (g_outCtl.muted) g_outCtl.vol = 0.0f;   // 静音设备如实显示 0%
-        }
+        pollAudioStateAsync();   // debug: 后台轮询（主线程零 CoreAudio 调用）
     }
 }
 
@@ -323,7 +374,7 @@ static void vfdStep(double dt) {
         g_screen->setFrRange(kFrRanges[std::clamp(g_frRangeIdx, 0, 4)]);
     }
     if (!g_shm) {
-        g_shm = shmring::ShmFrameRing::open("/systempeq_audio");
+        g_shm = shmring::ShmFrameRing::open("/vfdpeq_audio");
         if (g_shm && g_shm->ok() && !shmAttachLogged) {
             shmAttachLogged = true;
             fprintf(stderr, "[gui] shm attached (%u Hz)\n", g_shm->sampleRate());
@@ -714,7 +765,11 @@ void drawControls() {
         drawCtlText(slOut, "N/A", 0.20f);
     }
     drawCtlBox(rDev, g_glowVol[2].v, false);
-    drawCtlText(rDev, "DEVICE>", kTextBase + g_glowVol[2].v * 0.4f);
+    // debug: 切换进行中的乐观反馈（点击设备后 2.5s 窗口）
+    if (ImGui::GetTime() < g_deviceSwitchingUntil)
+        drawCtlText(rDev, "SWITCHING", kTextBase + g_glowVol[2].v * 0.4f);
+    else
+        drawCtlText(rDev, "DEVICE>", kTextBase + g_glowVol[2].v * 0.4f);
 
     // Preamp + 声道模式行：声道组合压缩到 freq 右缘（x0+83）为止，PRE 标签与 OUT 对齐
     int py0, py1; g_screen->preampRowRect(py0, py1);
@@ -765,8 +820,26 @@ static void drawControlInteractions(double dt) {
     {
         float d; bool act;
         ctlHotzone("pwr", rB[0], g_glowSide[0], dt, d, act);
+        // debug: 命中测试探针（2s 限频，鼠标在窗口内才打）——hovered=0 而鼠标在热区内 = 坐标系错位
+        static double lastProbe = 0;
+        const double nowT = ImGui::GetTime();
+        const ImGuiIO& mio = ImGui::GetIO();
+        const bool mouseInWindow = mio.MousePos.x > -10000;   // FLT_MAX = 鼠标不在窗口
+        if (nowT - lastProbe > 2.0 && mouseInWindow) {
+            lastProbe = nowT;
+            const float c = (float)cellPx();
+            const ImVec2 hz0(g_imgOrigin.x + rB[0].x0 * c, g_imgOrigin.y + rB[0].y0 * c);
+            const ImVec2 hz1(hz0.x + (rB[0].x1 - rB[0].x0 + 1) * c, hz0.y + (rB[0].y1 - rB[0].y0 + 1) * c);
+            peq_dbg("hit-test: mouse=(%.0f,%.0f) hotzone=(%.0f,%.0f)-(%.0f,%.0f) hovered=%d origin=(%.0f,%.0f) display=%.0fx%.0f",   // debug
+                    mio.MousePos.x, mio.MousePos.y, hz0.x, hz0.y, hz1.x, hz1.y,
+                    (int)ImGui::IsItemHovered(), g_imgOrigin.x, g_imgOrigin.y,
+                    mio.DisplaySize.x, mio.DisplaySize.y);
+        }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("PWR - EQ master bypass (audio passes through untouched)");
-        if (ImGui::IsItemClicked(0)) { g_conf.bypass = !g_conf.bypass; g_dirtySave = g_frDirty = true; }
+        if (ImGui::IsItemClicked(0)) {
+            g_conf.bypass = !g_conf.bypass; g_dirtySave = g_frDirty = true;
+            peq_dbg("ui: PWR clicked -> bypass=%d", (int)g_conf.bypass);   // debug
+        }
     }
     // RNG：FR 纵轴 ±6/12/18/24/36 循环
     {
@@ -778,6 +851,7 @@ static void drawControlInteractions(double dt) {
             g_conf.rngIdx = g_frRangeIdx;
             g_dirtySave = true;
             g_screen->setFrRange(kFrRanges[g_frRangeIdx]);
+            peq_dbg("ui: RNG clicked -> range +-%g dB", kFrRanges[g_frRangeIdx]);   // debug
         }
     }
     // INP：导入 EQAPO/REW 配置
@@ -848,9 +922,10 @@ static void drawControlInteractions(double dt) {
         if (act && d != 0) {
             g_inCtl.vol = std::min(1.0f, std::max(0.0f, g_inCtl.vol + d));
             clearMute(g_inCtl.dev); setVolumeScalar(g_inCtl.dev, g_inCtl.vol);
+            peq_dbg("ui: IN volume drag -> %.0f%%", g_inCtl.vol * 100);   // debug
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("SystemPEQ input volume (click to set, drag to fine-tune)");
+            ImGui::SetTooltip("VfdPEQ input volume (click to set, drag to fine-tune)");
         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) ImGui::OpenPopup("edin");
         if (ImGui::BeginPopup("edin")) {
             float pct = g_inCtl.vol * 100.0f;
@@ -869,6 +944,7 @@ static void drawControlInteractions(double dt) {
         if (act && d != 0) {
             g_outCtl.vol = std::min(1.0f, std::max(0.0f, g_outCtl.vol + d));
             clearMute(g_outCtl.dev); setVolumeScalar(g_outCtl.dev, g_outCtl.vol);
+            peq_dbg("ui: OUT volume drag -> %.0f%%", g_outCtl.vol * 100);   // debug
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Output device volume (%s)%s", g_outCtl.name.c_str(),
@@ -895,12 +971,13 @@ static void drawControlInteractions(double dt) {
                 devList.clear();
                 for (auto dev : outputDevices()) {
                     const std::string n = deviceName(dev);
-                    if (n.find("SystemPEQ") != std::string::npos) continue;  // 引擎输入通道，选它会死循环
+                    if (n.find("VfdPEQ") != std::string::npos) continue;  // 引擎输入通道，选它会死循环
                     devList.emplace_back(dev, n);
                 }
                 devListAt = ImGui::GetTime();
             }
             ImGui::OpenPopup("devmenu");
+            peq_dbg("ui: DEVICE> menu opened (%zu devices)", devList.size());   // debug
         }
         if (ImGui::BeginPopup("devmenu")) {
             for (auto& kv : devList) {
@@ -932,6 +1009,7 @@ static void drawControlInteractions(double dt) {
                 g_conf.preampDb[1] = g_conf.preampDb[0];
             }
             g_dirtySave = g_frDirty = true;
+            peq_dbg("ui: channel mode -> %s", g_conf.lrMode ? "L/R" : "L=R");   // debug
         }
     }
     if (g_conf.lrMode) {
@@ -950,6 +1028,7 @@ static void drawControlInteractions(double dt) {
         if (act && d != 0) {
             editPreamp() = std::min(12.0f, std::max(-12.0f, editPreamp() + d * 24.0f));
             g_dirtySave = true;
+            peq_dbg("ui: %s preamp drag -> %+.2f dB", chName, editPreamp());   // debug
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Preamp %s (dB) - affects audio, not the FR plot", chName);
@@ -979,7 +1058,10 @@ static void drawControlInteractions(double dt) {
             ctlHotzone("on", rOn, g_glowBand[i][0], dt, d, act);
             snprintf(tt, sizeof(tt), "%s CH - Band %d - enable/disable", chTag, i + 1);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tt);
-            if (ImGui::IsItemClicked(0)) { b.enabled = !b.enabled; g_dirtySave = g_frDirty = true; }
+            if (ImGui::IsItemClicked(0)) {
+                b.enabled = !b.enabled; g_dirtySave = g_frDirty = true;
+                peq_dbg("ui: %s CH band %d enable -> %d", chTag, i + 1, (int)b.enabled);   // debug
+            }
         }
         {
             float d; bool act;
@@ -991,6 +1073,7 @@ static void drawControlInteractions(double dt) {
                        : b.type == FilterType::Peaking  ? FilterType::HighShelf
                                                         : FilterType::LowShelf;
                 g_dirtySave = g_frDirty = true;
+                peq_dbg("ui: %s CH band %d type -> %s", chTag, i + 1, typeName(b.type));   // debug
             }
         }
         {
@@ -1003,6 +1086,7 @@ static void drawControlInteractions(double dt) {
                 u = std::min(1.0, std::max(0.0, (double)u));
                 b.freq = 20.0 * std::pow(10.0, 3.0 * u);
                 g_dirtySave = g_frDirty = true;
+                peq_dbg("ui: %s CH band %d freq drag -> %.1f Hz", chTag, i + 1, b.freq);   // debug
             }
             float f = (float)b.freq;
             ctlEditPopup("editf", &f, "%.1f");
@@ -1016,6 +1100,7 @@ static void drawControlInteractions(double dt) {
             if (act && d != 0) {
                 b.gainDB = std::min(12.0, std::max(-12.0, b.gainDB + (double)d * 24.0));
                 g_dirtySave = g_frDirty = true;
+                peq_dbg("ui: %s CH band %d gain drag -> %+.2f dB", chTag, i + 1, b.gainDB);   // debug
             }
             float g = (float)b.gainDB;
             ctlEditPopup("editg", &g, "%.2f");
@@ -1031,6 +1116,7 @@ static void drawControlInteractions(double dt) {
                 u = std::min(1.0, std::max(0.0, (double)u));
                 b.q = 0.1 * std::pow(10.0, 2.0 * u);
                 g_dirtySave = g_frDirty = true;
+                peq_dbg("ui: %s CH band %d Q drag -> %.3f", chTag, i + 1, b.q);   // debug
             }
             float q = (float)b.q;
             ctlEditPopup("editq", &q, "%.3f");
@@ -1050,9 +1136,48 @@ static NSStatusItem* g_statusItem = nil;
 static NSTask*       g_engineTask = nil;
 static bool          g_coreBusy = false;
 static bool          g_appTerminating = false;
-static volatile bool g_quitRequested = false;   // 信号置位，帧边界执行退出   // 终止中的回调一律早退（NSStatusItem 已被 teardown）
+static volatile bool g_quitRequested = false;   // 信号置位，帧边界执行退出
+static bool g_devicesChangedFlag = false;       // 设备变化置位，主线程节流处理
+static double g_lastDeviceCheck = 0;
+// debug: CoreAudio 设备缓存——主线程零 CoreAudio 枚举调用（设备变化期 CoreAudio 内部锁
+// 会让枚举调用秒级阻塞主线程，导致鼠标点击全部丢失）。缓存由后台队列刷新。
+static void refreshDeviceCacheAsync() {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        std::vector<CachedDevice> list;
+        AudioObjectPropertyAddress pa = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal,
+                                         kAudioObjectPropertyElementMain};
+        UInt32 sz = 0;
+        if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &pa, 0, NULL, &sz) != noErr) return;
+        std::vector<AudioDeviceID> devs(sz / sizeof(AudioDeviceID));
+        sz = devs.size() * sizeof(AudioDeviceID);
+        if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &pa, 0, NULL, &sz, devs.data()) != noErr) return;
+        for (size_t i = 0; i < devs.size(); ++i) {
+            AudioObjectPropertyAddress pn = {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+                                             kAudioObjectPropertyElementMain};
+            CFStringRef nm = NULL; UInt32 nsz = sizeof(nm);
+            if (AudioObjectGetPropertyData(devs[i], &pn, 0, NULL, &nsz, &nm) == noErr && nm) {
+                char buf[128] = {0};
+                CFStringGetCString(nm, buf, sizeof(buf), kCFStringEncodingUTF8);
+                CFRelease(nm);
+                list.push_back({devs[i], buf});
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_devCache = std::move(list);
+            g_devCacheValid = true;
+        });
+    });
+}
+// 缓存版查找：主线程安全（零 CoreAudio 调用）
+static AudioDeviceID findDeviceByNameCached(const std::string& name) {
+    for (auto& d : g_devCache) if (d.name == name) return d.id;
+    return kAudioObjectUnknown;
+}
+static volatile int g_enginePid = 0;            // debug: 引擎 pid（信号 handler 应急停止用，kill 是 signal-safe 的）   // 终止中的回调一律早退（NSStatusItem 已被 teardown）
 
 static void ensureSystemOutputIsPEQ();   // 前置声明（terminationHandler 里调用）
+static void startDrvLogStream();          // debug
+static void stopDrvLogStream();           // debug
 
 static NSString* projRoot() {
     const size_t a = g_confPath.find_last_of('/');        // .../engine
@@ -1062,7 +1187,7 @@ static NSString* projRoot() {
 }
 
 static bool driverInstalled() {
-    return [[NSFileManager defaultManager] fileExistsAtPath:@"/Library/Audio/Plug-Ins/HAL/SystemPEQ.driver"];
+    return [[NSFileManager defaultManager] fileExistsAtPath:@"/Library/Audio/Plug-Ins/HAL/VfdPEQ.driver"];
 }
 
 static bool engineAlive() {
@@ -1072,9 +1197,10 @@ static bool engineAlive() {
 
 static void trayUpdateIcon() {
     if (!g_statusItem || g_appTerminating) return;
-    if (g_coreBusy)                                g_statusItem.button.title = @"◐ EQ";
-    else if (engineAlive())                        g_statusItem.button.title = @"● EQ";
-    else                                           g_statusItem.button.title = @"○ EQ";
+    // unicode V 变体：🅅 工作中 / 🇻 停止 / 🆅 切换中
+    if (g_coreBusy)                                g_statusItem.button.title = @"🆅";
+    else if (engineAlive())                        g_statusItem.button.title = @"🅅";
+    else                                           g_statusItem.button.title = @"🇻";
 }
 
 // 同步跑一个任务，返回退出码
@@ -1100,15 +1226,21 @@ static bool runPrivilegedScript(NSString* scriptPath) {
 }
 
 static void stopEngineManaged() {
+    g_enginePid = 0;
     if (g_engineTask) {
         [g_engineTask setTerminationHandler:nil];   // 退出过程中不再派发（防野指针回调）
         if ([g_engineTask isRunning]) { [g_engineTask terminate]; [g_engineTask waitUntilExit]; }
         g_engineTask = nil;
     }
     system("pkill -f 'engine/build/peq_engine' 2>/dev/null");
+    // 引擎状态文件随引擎死亡而失效，删除防止旧 output_name 回灌配置
+    NSString* statusPath = [NSString stringWithFormat:@"%s/engine.status",
+                            g_confPath.substr(0, g_confPath.find_last_of('/')).c_str()];
+    [[NSFileManager defaultManager] removeItemAtPath:statusPath error:nil];
 }
 
 static bool startEngineManaged() {
+    peq_dbg("startEngineManaged: begin");   // debug
     stopEngineManaged();                            // RAII：存在就杀掉，由托盘启动
     NSString* enginePath = [projRoot() stringByAppendingPathComponent:@"engine/build/peq_engine"];
     if (![[NSFileManager defaultManager] fileExistsAtPath:enginePath]) {
@@ -1118,11 +1250,11 @@ static bool startEngineManaged() {
     NSTask* t = [NSTask new];
     t.executableURL = [NSURL fileURLWithPath:enginePath];
     t.standardInput = [NSFileHandle fileHandleWithNullDevice];    // 非交互：失配时引擎自动退出
-    NSString* logPath = @"/tmp/systempeq_engine.log";
+    NSString* logPath = @"/tmp/vfdpeq_engine.log";
     if (![[NSFileManager defaultManager] fileExistsAtPath:logPath])
         [[NSFileManager defaultManager] createFileAtPath:logPath contents:nil attributes:nil];
     NSFileHandle* log = [NSFileHandle fileHandleForWritingAtPath:logPath];
-    [log truncateFileAtOffset:0];
+    [log seekToEndOfFile];                      // debug: 追加模式（统一日志不截断）
     t.standardOutput = log; t.standardError = log;
     t.terminationHandler = ^(NSTask* task) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1158,61 +1290,62 @@ static bool startEngineManaged() {
         return false;
     }
     g_engineTask = t;
+    g_enginePid = (int)t.processIdentifier;     // debug
     fprintf(stderr, "[tray] engine started (pid %d)\n", (int)t.processIdentifier);
     return true;
 }
 
-static void clearDeviceConfig() {
-    stopEngineManaged();
-    g_conf.outputName.clear();
-    g_dirtySave = true;
-    peqconf::save(g_confPath.c_str(), g_conf);
-    fprintf(stderr, "[tray] device config mismatch -> cleared, off\n");
-    trayUpdateIcon();
-}
-
-// 设备失配 → 清空设备配置回退 off。
-// ⚠️ 去抖：CoreAudio listener 注册时会立即触发一次回调，且启动早期设备枚举
-// 可能不完整——"枚举未就绪"绝不能当成"配置失配"。失配需持续 1.5s 才执行清空。
-static double g_firstMismatchAt = 0;
+// 设备失配（配置指向的输出设备消失）：
+// 托盘【不】停引擎/清配置——引擎自身会在主循环检测失联并自动降级到可用输出
+// （fallbackOutputDevice），随后 engine.status 更新、本文件 §refreshEngineStatus 会同步配置。
+// 托盘只做状态刷新。实测：拔耳机 → 引擎 2s 内降级到内建扬声器，声音不断。
+static bool g_mismatchPending = false;
 static void checkDeviceMismatch() {
-    if (g_conf.outputName.empty()) { g_firstMismatchAt = 0; return; }
-    const double now = ImGui::GetTime();
+    if (g_conf.outputName.empty() || g_mismatchPending) return;
     if (findDeviceByName(g_conf.outputName) == kAudioObjectUnknown) {
-        if (g_firstMismatchAt == 0) { g_firstMismatchAt = now; return; }
-        if (now - g_firstMismatchAt < 1.5) return;      // 去抖窗口
-        g_firstMismatchAt = 0;
-        clearDeviceConfig();
-    } else {
-        g_firstMismatchAt = 0;
+        g_mismatchPending = true;
+        peq_dbg("mismatch: config device gone, waiting for engine fallback");   // debug
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)2.5 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            g_mismatchPending = false;
+            if (g_conf.outputName.empty()) return;
+            if (findDeviceByName(g_conf.outputName) == kAudioObjectUnknown) {
+                // 引擎 2s 拍已处理（status 应已变更）；此处仅兜底刷新 UI 状态
+                peq_dbg("mismatch: engine fallback pending, refresh UI only");   // debug
+                refreshEngineStatus();
+            } else {
+                peq_dbg("mismatch cleared: device back");   // debug
+            }
+        });
     }
 }
 
-// Core ON 的收尾：确保系统默认输出指向 SystemPEQ（卸载 driver 时 macOS 会把默认
+// Core ON 的收尾：确保系统默认输出指向 VfdPEQ（卸载 driver 时 macOS 会把默认
 // 输出切走，重装后不会自动切回——不补这一步，整个 EQ 链路的第一环就是断的）
 static void ensureSystemOutputIsPEQ() {
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         for (int i = 0; i < 50; ++i) {                      // 最多等 5 秒（驱动重载有延迟）
-            const AudioDeviceID d = findDeviceByName("SystemPEQ 2ch");
+            const AudioDeviceID d = findDeviceByName("VfdPEQ 2ch");
             if (d != kAudioObjectUnknown) {
                 AudioObjectPropertyAddress pa = {kAudioHardwarePropertyDefaultOutputDevice,
                                                  kAudioObjectPropertyScopeGlobal,
                                                  kAudioObjectPropertyElementMain};
                 OSStatus err = AudioObjectSetPropertyData(kAudioObjectSystemObject, &pa, 0,
                                                           nullptr, sizeof(d), &d);
-                fprintf(stderr, "[tray] system default output -> SystemPEQ (%s)\n",
+                fprintf(stderr, "[tray] system default output -> VfdPEQ (%s)\n",
                         err == noErr ? "ok" : "failed");
                 return;
             }
             usleep(100000);
         }
-        fprintf(stderr, "[tray] SystemPEQ device never appeared; default output unchanged\n");
+        fprintf(stderr, "[tray] VfdPEQ device never appeared; default output unchanged\n");
     });
 }
 
 static void coreOn() {
     if (g_coreBusy) return;
     g_coreBusy = true; trayUpdateIcon();
+    peq_dbg("coreOn: begin (driverInstalled=%d)", driverInstalled() ? 1 : 0);   // debug
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         system("pkill -f 'engine/build/peq_engine' 2>/dev/null");   // RAII: 存在就杀
         bool ok = true;
@@ -1221,8 +1354,9 @@ static void coreOn() {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (g_appTerminating) return;
             g_coreBusy = false;
-            if (ok) { startEngineManaged(); ensureSystemOutputIsPEQ(); }
+            if (ok) { startEngineManaged(); ensureSystemOutputIsPEQ(); startDrvLogStream(); }
             else fprintf(stderr, "[tray] core ON aborted (driver install failed)\n");
+            peq_dbg("coreOn: done (ok=%d)", ok ? 1 : 0);   // debug
             trayUpdateIcon();
         });
     });
@@ -1230,7 +1364,7 @@ static void coreOn() {
 
 static void coreOff() {
     if (g_coreBusy) return;
-    g_coreBusy = true; trayUpdateIcon();
+    g_coreBusy = true; trayUpdateIcon(); stopDrvLogStream();
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         stopEngineManaged();
         bool ok = runPrivilegedScript([projRoot() stringByAppendingPathComponent:@"scripts/uninstall.sh"]);
@@ -1244,9 +1378,18 @@ static void coreOff() {
 }
 
 static void deviceSelect(NSString* name) {
+    peq_dbg("deviceSelect: '%s' (engineAlive=%d coreBusy=%d driverInstalled=%d)",   // debug
+            name.UTF8String, engineAlive() ? 1 : 0, g_coreBusy ? 1 : 0, driverInstalled() ? 1 : 0);
+    g_deviceSwitchingUntil = ImGui::GetTime() + 2.5;
     g_conf.outputName = name.UTF8String;
     g_dirtySave = true;
     peqconf::save(g_confPath.c_str(), g_conf);      // 立即落盘（不依赖 draw 循环）
+    // Core 未就绪（驱动未装/引擎未跑）→ 先拉起 Core：装驱动 + 起引擎，引擎起来后
+    // 会读取 conf 的 output_name 自动绑定目标设备
+    if (!driverInstalled()) {
+        if (!g_coreBusy) coreOn();                  // coreOn 完成后会 startEngineManaged
+        return;                                     // conf 已写好，Core 起来后自动生效
+    }
     if (!engineAlive() && !g_coreBusy) startEngineManaged();
     trayUpdateIcon();
 }
@@ -1260,7 +1403,7 @@ static void deviceOff() {
 }
 
 static NSString* launchAgentPlist() {
-    return [@"/dev.systempeq.gui.plist" stringByExpandingTildeInPath];
+    return [@"/dev.vfdpeq.gui.plist" stringByExpandingTildeInPath];
 }
 static bool launchAtLoginOn() {
     return [[NSFileManager defaultManager] fileExistsAtPath:launchAgentPlist()];
@@ -1270,11 +1413,11 @@ static void setLaunchAtLogin(bool on) {
         // 一次性写 sudoers 白名单：开机自启场景 driver 装卸免密
         NSString* cmd = [NSString stringWithFormat:
             @"echo \"$USER ALL=(root) NOPASSWD: %@/scripts/install.sh, %@/scripts/uninstall.sh\" "
-            @"> /etc/sudoers.d/systempeq && chmod 440 /etc/sudoers.d/systempeq",
+            @"> /etc/sudoers.d/vfdpeq && chmod 440 /etc/sudoers.d/vfdpeq",
             projRoot(), projRoot()];
         runTask(@"/usr/bin/osascript",
                 @[[NSString stringWithFormat:@"do shell script \"%@\" with administrator privileges", cmd]]);
-        NSDictionary* d = @{@"Label": @"dev.systempeq.gui",
+        NSDictionary* d = @{@"Label": @"dev.vfdpeq.gui",
                             @"ProgramArguments": @[[projRoot() stringByAppendingPathComponent:@"gui/build/peq_gui"]],
                             @"RunAtLoad": @YES, @"KeepAlive": @NO};
         [d writeToFile:launchAgentPlist() atomically:YES];
@@ -1341,7 +1484,7 @@ static void setLaunchAtLogin(bool on) {
     [dev addItem:[NSMenuItem separatorItem]];
     for (auto d : outputDevices()) {
         std::string n = deviceName(d);
-        if (n.find("SystemPEQ") != std::string::npos) continue;    // 引擎输入通道，排除
+        if (n.find("VfdPEQ") != std::string::npos) continue;    // 引擎输入通道，排除
         NSMenuItem* it = [dev addItemWithTitle:[NSString stringWithUTF8String:n.c_str()]
                                         action:@selector(devicePick:) keyEquivalent:@""];
         it.target = self;
@@ -1364,10 +1507,58 @@ static void setLaunchAtLogin(bool on) {
 - (void)devicePick:(NSMenuItem*)sender { deviceSelect(sender.representedObject); }
 - (void)toggleLogin   { setLaunchAtLogin(!launchAtLoginOn()); trayUpdateIcon(); }
 - (void)quit {
-    stopEngineManaged();                            // RAII 收尸：engine 一并停
-    [NSApp terminate:nil];
+    // debug: 退出完整收尸——停 engine + 卸载驱动（Core 语义：托盘退出 = 全部清理）
+    g_appTerminating = true;
+    stopDrvLogStream();
+    stopEngineManaged();
+    peq_dbg("quit: engine stopped, uninstalling driver");   // debug
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        const bool ok = runPrivilegedScript(
+            [projRoot() stringByAppendingPathComponent:@"scripts/uninstall.sh"]);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            peq_dbg("quit: driver uninstall %s", ok ? "ok" : "failed/cancelled");   // debug
+            [NSApp terminate:nil];
+        });
+    });
 }
 @end
+
+static NSTask* g_drvLogTask = nil;   // debug: log stream 子进程，把驱动 syslog 汇入统一日志文件
+
+// debug: 启动驱动日志汇聚（syslog → ~/.vfdpeq_gui.debug.log），随托盘生命周期
+static void startDrvLogStream() {
+    if (g_drvLogTask) return;
+    const char* home = getenv("HOME");
+    NSString* logPath = [NSString stringWithFormat:@"%s/.vfdpeq_gui.debug.log", home];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:logPath])
+        [[NSFileManager defaultManager] createFileAtPath:logPath contents:nil attributes:nil];
+    NSFileHandle* fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    [fh seekToEndOfFile];
+    NSTask* t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/log"];
+    t.arguments = @[@"stream", @"--predicate",
+                    @"eventMessage CONTAINS \"VfdPEQ-DRV\"",
+                    @"--style", @"compact"];
+    t.standardOutput = fh; t.standardError = fh;
+    t.terminationHandler = ^(NSTask* task) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_drvLogTask == task) g_drvLogTask = nil;
+        });
+    };
+    NSError* err = nil;
+    if (![t launchAndReturnError:&err]) {
+        fprintf(stderr, "[tray] drv log stream failed: %s\n", err.localizedDescription.UTF8String);
+        return;
+    }
+    g_drvLogTask = t;
+}
+static void stopDrvLogStream() {
+    if (g_drvLogTask) {
+        [g_drvLogTask setTerminationHandler:nil];
+        if ([g_drvLogTask isRunning]) [g_drvLogTask terminate];
+        g_drvLogTask = nil;
+    }
+}
 
 static TrayDelegate* g_trayDelegate = nil;
 static void traySetup() {
@@ -1375,18 +1566,22 @@ static void traySetup() {
     // ⚠️ MRC：工厂方法返回 autoreleased 对象，必须 retain——否则 autorelease pool
     // 排空后 g_statusItem 悬垂（SIGINT/teardown 内存复用后必崩，实测打在 NSExtraMIData 上）
     g_statusItem = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
-    g_statusItem.button.title = @"○ EQ";
+    g_statusItem.button.title = @"🇻";
     g_statusItem.button.target = g_trayDelegate;
     g_statusItem.button.action = @selector(statusClicked);
     [g_statusItem.button sendActionOn:NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp];
     trayUpdateIcon();
     // 设备热插拔监听：任何时候失配 → 清配置回退 off
     static dispatch_queue_t q;
-    q = dispatch_queue_create("dev.systempeq.audiolistener", nullptr);
+    q = dispatch_queue_create("dev.vfdpeq.audiolistener", nullptr);
+    // g_devicesChangedFlag 由 drawFrame 每秒节流消费（避免唤醒风暴期主线程枚举风暴）
     static AudioObjectPropertyAddress pa = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal,
                                             kAudioObjectPropertyElementMain};
     AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &pa, q,
-        ^(UInt32, const AudioObjectPropertyAddress*) { checkDeviceMismatch(); });
+        ^(UInt32, const AudioObjectPropertyAddress*) {
+            g_devicesChangedFlag = true;
+            refreshDeviceCacheAsync();   // debug: 后台刷新设备缓存
+        });
 }
 
 // ---------------------------------------------------------------- ImGui frame
@@ -1395,9 +1590,12 @@ static void drawFrame(id<MTLDevice> device) {
     static double last = 0;
     double dt = (last > 0) ? std::min(now - last, 0.25) : 1.0 / 60.0;
     last = now;
+    // debug: 慢帧探针——帧间隔异常（UI 卡死）时打点，供组合问题回溯
+    if (dt > 0.5) peq_dbg("SLOW FRAME: %.3fs gap at %.0fs uptime", dt, now);
 
     // 退出走帧边界：teardown 不能与仍在排队的 draw block 交错（会踩坏堆）
     if (g_quitRequested && !g_appTerminating) {
+        peq_dbg("quit requested at frame boundary");   // debug
         g_appTerminating = true;
         stopEngineManaged();
         [NSApp terminate:nil];
@@ -1419,7 +1617,7 @@ static void drawFrame(id<MTLDevice> device) {
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 10));
-    ImGui::Begin("SystemPEQ", nullptr,
+    ImGui::Begin("VfdPEQ", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoBringToFrontOnFocus);
 
@@ -1466,6 +1664,34 @@ static void drawFrame(id<MTLDevice> device) {
             ImGui::SetTooltip("L  VU %+.1f dB  |  PK %+.1f dB\nR  VU %+.1f dB  |  PK %+.1f dB",
                               lv, lp, rv, rp);
         }
+    }
+
+    // debug: 鼠标事件监听心跳 + 点击即时记录
+    // ① 每次按键状态翻转即时打点——卡死时点击若出现 "mouse: DOWN" = 事件流活着（问题在热区/逻辑）；
+    //    若无 = 输入监听本身断流（问题在系统层）。② 每秒一条心跳证明输入管道在持续工作。
+    {
+        const ImGuiIO& mio = ImGui::GetIO();
+        static bool lastDown = false;
+        if ((bool)mio.MouseDown[0] != lastDown) {
+            lastDown = mio.MouseDown[0];
+            peq_dbg("mouse: %s at (%.0f,%.0f) capture=%d",   // debug
+                    lastDown ? "DOWN" : "UP", mio.MousePos.x, mio.MousePos.y,
+                    (int)mio.WantCaptureMouse);
+        }
+        static double lastMouseHb = 0;
+        if (now - lastMouseHb > 1.0) {
+            lastMouseHb = now;
+            peq_dbg("mouse-hb: pos=(%.0f,%.0f) down=%d capture=%d fps=%.0f",   // debug
+                    mio.MousePos.x, mio.MousePos.y, (int)mio.MouseDown[0],
+                    (int)mio.WantCaptureMouse, mio.Framerate);
+        }
+    }
+
+    // 设备变化节流处理：最多每秒一次失配复查（唤醒风暴/拔插风暴合并）
+    if (g_devicesChangedFlag && now - g_lastDeviceCheck > 1.0) {
+        g_devicesChangedFlag = false;
+        g_lastDeviceCheck = now;
+        checkDeviceMismatch();
     }
 
     ensureVolumeBindings();
@@ -1529,7 +1755,15 @@ static void drawFrame(id<MTLDevice> device) {
 // dispatch source 执行——直接在 handler 里 dispatch_async 会撞上中断点上的
 // 运行时/堆锁导致 SIGSEGV。
 static int g_sigFd[2] = {-1, -1};
-static void guiSignalHandler(int) {
+static void guiSignalHandler(int sig) {
+    const char* home = getenv("HOME");
+    char mpath[512]; snprintf(mpath, sizeof(mpath), "%s/.sighandler_marker", home ? home : "/tmp");
+    int mfd = open(mpath, O_WRONLY | O_CREAT | O_APPEND, 0644);   // debug
+    if (mfd >= 0) { write(mfd, "HIT\n", 4); close(mfd); }                            // debug
+    // debug: 应急兜底——直接给引擎发 SIGTERM（kill 是 signal-safe 的）。
+    // 正常退出流程由 self-pipe → 帧边界完成；这里保证即使 GUI 的退出流程
+    // 因任何原因失效（渲染循环停摆、handler 链断裂），引擎也不会变孤儿。
+    if (g_enginePid > 0) kill(g_enginePid, SIGTERM);
     if (g_sigFd[1] >= 0) { char c = 1; ssize_t r = write(g_sigFd[1], &c, 1); (void)r; }
 }
 static void guiSignalSetup() {
@@ -1537,10 +1771,31 @@ static void guiSignalSetup() {
     fcntl(g_sigFd[1], F_SETFL, O_NONBLOCK);
     dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, g_sigFd[0], 0,
                                                    dispatch_get_main_queue());
-    dispatch_source_set_event_handler(src, ^{ g_quitRequested = true; });
+    dispatch_source_set_event_handler(src, ^{
+        // debug: 退出决策在主队列 handler 直接执行——后台窗口的渲染循环可能停摆，
+        // 依赖 drawFrame 消费退出标志会永远不退出。主队列串行保证与 draw 无交错。
+        g_quitRequested = true;
+        if (!g_appTerminating) {
+            g_appTerminating = true;
+            stopEngineManaged();
+            [NSApp terminate:nil];
+        }
+    });
     dispatch_resume(src);
-    signal(SIGINT, guiSignalHandler);
-    signal(SIGTERM, guiSignalHandler);
+    // debug: 用 sigaction（比 signal 可靠）+ 显式确认安装
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = guiSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, nullptr) == 0 && sigaction(SIGTERM, &sa, nullptr) == 0)
+        peq_dbg("signal handlers installed (sigaction, self-pipe + engine kill)");   // debug
+    else
+        peq_dbg("signal handler install FAILED");   // debug
+    // debug: 检查主线程信号掩码（SIGINT 被阻塞会导致 pending 永不投递）
+    sigset_t cur;
+    pthread_sigmask(SIG_BLOCK, NULL, &cur);
+    peq_dbg("SIGINT blocked=%d SIGTERM blocked=%d",
+            sigismember(&cur, SIGINT) == 1, sigismember(&cur, SIGTERM) == 1);   // debug
 }
 
 @implementation AppDelegate
@@ -1548,21 +1803,25 @@ static void guiSignalSetup() {
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
     (void)note;
     guiSignalSetup();
+    peq_dbg("signal handlers installed (SIGINT/SIGTERM -> self-pipe + engine kill)");   // debug
     traySetup();
+    refreshDeviceCacheAsync();
     coreOn();       // 软件运行时默认立马开启（driver 缺失时弹一次密码框）
 }
 - (void)applicationWillTerminate:(NSNotification*)note {
     (void)note;
     g_appTerminating = true;
+    stopDrvLogStream();
     stopEngineManaged();    // RAII 收尸
 }
 @end
 
 int main(int argc, const char** argv) {
+    peq_dbg_init("GUI");   // debug
     // ---- 单实例保护（flock）：多实例会互杀 engine，托盘语义完全失效 ----
     static int lockFd = -1;
     {
-        lockFd = open("/tmp/systempeq_gui.lock", O_RDWR | O_CREAT, 0600);
+        lockFd = open("/tmp/vfdpeq_gui.lock", O_RDWR | O_CREAT, 0600);
         if (lockFd >= 0 && flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
             fprintf(stderr, "[gui] another instance is running, exiting\n");
             close(lockFd);
@@ -1605,7 +1864,7 @@ int main(int argc, const char** argv) {
                                                           backing:NSBackingStoreBuffered
                                                             defer:NO];
         window.releasedWhenClosed = NO;
-        window.title = @"SystemPEQ";
+        window.title = @"VfdPEQ";
         window.contentView = view;
         window.delegate = view;
         g_window = window;

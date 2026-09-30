@@ -1,8 +1,8 @@
 #!/bin/bash
-# Uninstall SystemPEQ HAL driver (requires sudo)
+# Uninstall VfdPEQ HAL driver (requires sudo)
 set -e
 
-DEST="/Library/Audio/Plug-Ins/HAL/SystemPEQ.driver"
+DEST="/Library/Audio/Plug-Ins/HAL/VfdPEQ.driver"
 
 if [ "$EUID" -ne 0 ]; then
     echo "Please run with sudo: sudo $0"
@@ -15,5 +15,5 @@ if [ -d "$DEST" ]; then
 fi
 
 echo "Restarting coreaudiod ..."
-launchctl kickstart -k system/com.apple.audio.coreaudiod
-echo "Done. SystemPEQ device removed."
+killall coreaudiod 2>/dev/null || true
+echo "Done. VfdPEQ device removed."

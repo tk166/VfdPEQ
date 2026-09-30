@@ -1,4 +1,4 @@
-# SystemPEQ GUI — ImGui (Metal) + VfdSpecturm renderer, no Xcode needed
+# VfdPEQ GUI — ImGui (Metal) + VfdSpecturm renderer, no Xcode needed
 CXX   := clang++
 SDK   := $(shell xcrun --show-sdk-path)
 BUILD := build

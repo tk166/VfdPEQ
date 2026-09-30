@@ -348,12 +348,12 @@ static Float32*                     gRingBuffer = NULL;
 #pragma mark Prototypes
 
 //    Entry points for the COM methods
-void*                SystemPEQ_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID);
+void*                VfdPEQ_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID);
 static HRESULT        BlackHole_QueryInterface(void* inDriver, REFIID inUUID, LPVOID* outInterface);
 static ULONG        BlackHole_AddRef(void* inDriver);
 static ULONG        BlackHole_Release(void* inDriver);
 static OSStatus        BlackHole_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost);
-static OSStatus        SystemPEQ_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDictionaryRef inDescription, const AudioServerPlugInClientInfo* inClientInfo, AudioObjectID* outDeviceObjectID);
+static OSStatus        VfdPEQ_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDictionaryRef inDescription, const AudioServerPlugInClientInfo* inClientInfo, AudioObjectID* outDeviceObjectID);
 static OSStatus        BlackHole_DestroyDevice(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID);
 static OSStatus        BlackHole_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo);
 static OSStatus        BlackHole_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo);
@@ -412,7 +412,7 @@ static AudioServerPlugInDriverInterface    gAudioServerPlugInDriverInterface =
     BlackHole_AddRef,
     BlackHole_Release,
     BlackHole_Initialize,
-    SystemPEQ_CreateDevice,
+    VfdPEQ_CreateDevice,
     BlackHole_DestroyDevice,
     BlackHole_AddDeviceClient,
     BlackHole_RemoveDeviceClient,
@@ -614,7 +614,7 @@ static bool is_valid_sample_rate(Float64 sample_rate)
 
 #pragma mark Factory
 
-void*	SystemPEQ_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID)
+void*	VfdPEQ_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID)
 {
 	//	This is the CFPlugIn factory function. Its job is to create the implementation for the given
 	//	type provided that the type is supported. Because this driver is simple and all its
@@ -797,7 +797,7 @@ Done:
 	return theAnswer;
 }
 
-static OSStatus	SystemPEQ_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDictionaryRef inDescription, const AudioServerPlugInClientInfo* inClientInfo, AudioObjectID* outDeviceObjectID)
+static OSStatus	VfdPEQ_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDictionaryRef inDescription, const AudioServerPlugInClientInfo* inClientInfo, AudioObjectID* outDeviceObjectID)
 {
 	//	This method is used to tell a driver that implements the Transport Manager semantics to
 	//	create an AudioEndpointDevice from a set of AudioEndpoints. Since this driver is not a
@@ -810,7 +810,7 @@ static OSStatus	SystemPEQ_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDi
 	OSStatus theAnswer = kAudioHardwareUnsupportedOperationError;
 	
 	//	check the arguments
-	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemPEQ_CreateDevice: bad driver reference");
+	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "VfdPEQ_CreateDevice: bad driver reference");
 
 Done:
 	return theAnswer;
@@ -4558,9 +4558,9 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         {
             static SInt64 dbgCount = 0;
             if (dbgCount++ % 200 == 0)
-                DebugMsg("SPEQ-DBG ReadInput CLEAR branch #%lld: lastOut=%.0f inputTime=%.0f frameSize=%u mute=%d",
-                         dbgCount, lastOutputSampleTime, inIOCycleInfo->mInputTime.mSampleTime,
-                         inIOBufferFrameSize, gMute_Master_Value);
+                syslog(LOG_NOTICE, "VfdPEQ-DRV: ReadInput CLEAR #%lld lastOut=%.0f inputTime=%.0f mute=%d",   // debug: 驱动日志走 syslog，由托盘 log stream 汇入统一文件
+                       dbgCount, lastOutputSampleTime, inIOCycleInfo->mInputTime.mSampleTime,
+                       gMute_Master_Value);
             // Clear the ioMainBuffer
             vDSP_vclr(ioMainBuffer, 1, inIOBufferFrameSize * kNumber_Of_Channels);
             
@@ -4575,8 +4575,8 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         {
             static SInt64 dbgCount = 0;
             if (dbgCount++ % 200 == 0)
-                DebugMsg("SPEQ-DBG ReadInput COPY branch #%lld: lastOut=%.0f inputTime=%.0f",
-                         dbgCount, lastOutputSampleTime, inIOCycleInfo->mInputTime.mSampleTime);
+                syslog(LOG_NOTICE, "VfdPEQ-DRV: ReadInput COPY #%lld lastOut=%.0f inputTime=%.0f",   // debug
+                       dbgCount, lastOutputSampleTime, inIOCycleInfo->mInputTime.mSampleTime);
             // Copy the buffers.
             memcpy(ioMainBuffer, gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
             memcpy((Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, gRingBuffer, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
@@ -4613,8 +4613,8 @@ static OSStatus	BlackHole_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         {
             static SInt64 dbgCount = 0;
             if (dbgCount++ % 200 == 0)
-                DebugMsg("SPEQ-DBG WriteMix #%lld: outputTime=%.0f frames=%u",
-                         dbgCount, inIOCycleInfo->mOutputTime.mSampleTime, inIOBufferFrameSize);
+                syslog(LOG_NOTICE, "VfdPEQ-DRV: WriteMix #%lld outputTime=%.0f frames=%u",   // debug
+                       dbgCount, inIOCycleInfo->mOutputTime.mSampleTime, inIOBufferFrameSize);
         }
     }
 

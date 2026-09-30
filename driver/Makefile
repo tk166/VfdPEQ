@@ -1,10 +1,10 @@
-# SystemPEQ HAL driver — pure clang build, no Xcode/cmake required
+# VfdPEQ HAL driver — pure clang build, no Xcode/cmake required
 # Driver code is a fork of BlackHole (GPL-3.0), see LICENSE.
 
 CC      := clang
 SDK     := $(shell xcrun --show-sdk-path)
 ARCH    := arm64
-DRIVER  := SystemPEQ
+DRIVER  := VfdPEQ
 VERSION := 0.1.0
 
 BUILD   := build
@@ -13,12 +13,13 @@ SRC     := src/$(DRIVER).c
 # Driver identity (overridable via #ifndef in source)
 DEFINES := \
 	-DkDriver_Name='"$(DRIVER)"' \
-	-DkPlugIn_BundleID='"dev.systempeq.hal"' \
-	-DkManufacturer_Name='"SystemPEQ Project"' \
+	-DkPlugIn_BundleID='"dev.vfdpeq.hal"' \
+	-DkManufacturer_Name='"VfdPEQ Project"' \
 	-DkNumber_Of_Channels=2 \
 	-DkDevice_IsHidden=false \
 	-DkDevice2_IsHidden=true \
-	-DDEBUG=1
+	-DDEBUG=1 \
+	-DPEQ_DEBUG_LOG_PATH=\"$(HOME)/.vfdpeq_gui.debug.log\"
 
 CFLAGS  := -arch $(ARCH) -bundle -O2 -DNDEBUG \
 	-mmacosx-version-min=12.0 \

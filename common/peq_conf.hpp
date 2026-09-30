@@ -112,7 +112,7 @@ inline Conf load(const char* path) {
 inline bool save(const char* path, const Conf& c) {
     FILE* f = fopen(path, "w");
     if (!f) return false;
-    fprintf(f, "# SystemPEQ config - hot-reloaded by the engine\n");
+    fprintf(f, "# VfdPEQ config - hot-reloaded by the engine\n");
     fprintf(f, c.lrMode ? "# L/R\n" : "# L=R\n");
     fprintf(f, "bypass %d\n", c.bypass ? 1 : 0);
     fprintf(f, "preamp %.2f\n", c.preampDb[0]);

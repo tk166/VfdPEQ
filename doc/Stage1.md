@@ -1,4 +1,4 @@
-# 在新电脑重建 SystemPEQ 驱动
+# 在新电脑重建 VfdPEQ 驱动
 
 ## 🧑‍💻 User
 
@@ -7,12 +7,12 @@
 ---
 ## 🌋 Ark
 
-下午好！我先确认一下之前项目的实际状态——计划里提到项目搭建在 `~/Projects/SystemPEQ`，我看看这台电脑上它是否还在。
+下午好！我先确认一下之前项目的实际状态——计划里提到项目搭建在 `~/Projects/VfdPEQ`，我看看这台电脑上它是否还在。
 
-这台电脑上 `~/Projects/SystemPEQ` **不存在**，系统版本也和计划里记录的（macOS 15.7.3）不同——现在是 macOS 26.5.2，看来这是一台新的/不同的电脑，之前的代码没有同步过来，需要重新搭建。好消息是：
+这台电脑上 `~/Projects/VfdPEQ` **不存在**，系统版本也和计划里记录的（macOS 15.7.3）不同——现在是 macOS 26.5.2，看来这是一台新的/不同的电脑，之前的代码没有同步过来，需要重新搭建。好消息是：
 
 - clang 17.0.0 还在，编译环境基础具备
-- `/Library/Audio/Plug-Ins/HAL/` 里还没有 SystemPEQ（干净状态，不受旧驱动干扰）
+- `/Library/Audio/Plug-Ins/HAL/` 里还没有 VfdPEQ（干净状态，不受旧驱动干扰）
 
 我先快速验证一下这套环境的 SDK、构建工具链和网络能否拉到 BlackHole 源码：
 
@@ -25,15 +25,15 @@
 ✅ 项目已在这台电脑上重新搭建完成，驱动骨架**一次编译通过**。当前状态：
 
 ```
-~/Projects/SystemPEQ/
+~/Projects/VfdPEQ/
 ├── driver/
-│   ├── src/SystemPEQ.c          ← BlackHole fork（工厂符号已改名 SystemPEQ_Create，4626 行）
-│   ├── resources/Info.plist     ← dev.systempeq.hal，plutil lint OK
+│   ├── src/VfdPEQ.c          ← BlackHole fork（工厂符号已改名 VfdPEQ_Create，4626 行）
+│   ├── resources/Info.plist     ← dev.vfdpeq.hal，plutil lint OK
 │   └── Makefile                 ← 纯 clang，已适配本机 CLT SDK
 ├── scripts/install.sh / uninstall.sh
 ├── engine/  gui/                ← 空目录，等阶段 2/3
 ├── LICENSE (GPL-3.0) + README.md
-└── driver/build/SystemPEQ.driver  ← ✅ arm64 bundle + ad-hoc 签名 + 导出符号验证通过
+└── driver/build/VfdPEQ.driver  ← ✅ arm64 bundle + ad-hoc 签名 + 导出符号验证通过
 ```
 
 编译只有一个无害警告（BlackHole 原有代码的 unused 变量），签名、plist、符号导出全部校验通过。
@@ -46,12 +46,12 @@
 **接下来需要你跑安装（要 sudo 密码）：**
 
 ```bash
-cd ~/Projects/SystemPEQ && sudo ./scripts/install.sh
+cd ~/Projects/VfdPEQ && sudo ./scripts/install.sh
 ```
 
-装完后在 系统设置 → 声音 → 输出 里选 "SystemPEQ 2ch" 试试（此时没有引擎接管，声音会被“吞掉”，属正常；随时可切回原设备）。之后告诉我安装结果，我们进入阶段 2 写 C++ PEQ 引擎。
+装完后在 系统设置 → 声音 → 输出 里选 "VfdPEQ 2ch" 试试（此时没有引擎接管，声音会被“吞掉”，属正常；随时可切回原设备）。之后告诉我安装结果，我们进入阶段 2 写 C++ PEQ 引擎。
 
-项目已重建完毕并记录。等你在终端跑完 `sudo ./scripts/install.sh` 后告诉我结果，我们就可以继续阶段 2（C++ PEQ 引擎：从 SystemPEQ 读取 → RBJ biquad 级联 → 输出到真实设备）了。
+项目已重建完毕并记录。等你在终端跑完 `sudo ./scripts/install.sh` 后告诉我结果，我们就可以继续阶段 2（C++ PEQ 引擎：从 VfdPEQ 读取 → RBJ biquad 级联 → 输出到真实设备）了。
 
 ---
 ## 🧑‍💻 User
@@ -72,7 +72,7 @@ cd ~/Projects/SystemPEQ && sudo ./scripts/install.sh
 ├── engine/  gui/            ← 待阶段 2/3 填充
 ├── scripts/install.sh / uninstall.sh
 ├── LICENSE (GPL-3.0) + README.md
-└── driver/build/SystemPEQ.driver  ← 最新构建产物
+└── driver/build/VfdPEQ.driver  ← 最新构建产物
 ```
 
 构建脚本都是相对路径，迁移后无需任何修改。
@@ -83,7 +83,7 @@ cd ~/Projects/SystemPEQ && sudo ./scripts/install.sh
 cd ~/prj/260929-eqmac && sudo ./scripts/install.sh
 ```
 
-装完后在系统设置把输出切到 "SystemPEQ 2ch"，然后我们就可以开始阶段 2 的 C++ PEQ 引擎了。
+装完后在系统设置把输出切到 "VfdPEQ 2ch"，然后我们就可以开始阶段 2 的 C++ PEQ 引擎了。
 
 项目位置已固定为 `~/prj/260929-eqmac`。下一步就等你跑 `sudo ./scripts/install.sh` 安装驱动了。
 
@@ -91,7 +91,7 @@ cd ~/prj/260929-eqmac && sudo ./scripts/install.sh
 ## 🧑‍💻 User
 
 (py312) tkalpha@ChilloutStartup 260929-eqmac % sudo ./scripts/install.sh
-Copying SystemPEQ.driver to /Library/Audio/Plug-Ins/HAL/SystemPEQ.driver ...
+Copying VfdPEQ.driver to /Library/Audio/Plug-Ins/HAL/VfdPEQ.driver ...
 Restarting coreaudiod ...
 Could not kickstart service "com.apple.audio.coreaudiod": 150: Operation not permitted while System Integrity Protection is engaged
 
@@ -106,7 +106,7 @@ Could not kickstart service "com.apple.audio.coreaudiod": 150: Operation not per
 sudo killall coreaudiod
 ```
 
-launchd 会立刻把它拉起来（音频可能会闪断一两秒）。跑完后我帮你确认 SystemPEQ 设备是否出现。
+launchd 会立刻把它拉起来（音频可能会闪断一两秒）。跑完后我帮你确认 VfdPEQ 设备是否出现。
 
 ---
 ## 🧑‍💻 User
@@ -116,9 +116,9 @@ launchd 会立刻把它拉起来（音频可能会闪断一两秒）。跑完后
 ---
 ## 🌋 Ark
 
-设备已经活了——`SystemPEQ 2ch`，2 进 2 出、48kHz、Transport: Virtual ✅ 阶段 1 完成。
+设备已经活了——`VfdPEQ 2ch`，2 进 2 出、48kHz、Transport: Virtual ✅ 阶段 1 完成。
 
-现在进入**阶段 2：C++ PEQ 引擎**。架构：在 SystemPEQ 设备上注册 IOProc 捕获系统音频 → 无锁环形缓冲 → 默认输出单元回调里跑 10 段 biquad（RBJ cookbook）→ 播放到真实设备；EQ 参数从 `peq.conf` 热加载（后面 GUI 直接写这个文件即可）。开写：
+现在进入**阶段 2：C++ PEQ 引擎**。架构：在 VfdPEQ 设备上注册 IOProc 捕获系统音频 → 无锁环形缓冲 → 默认输出单元回调里跑 10 段 biquad（RBJ cookbook）→ 播放到真实设备；EQ 参数从 `peq.conf` 热加载（后面 GUI 直接写这个文件即可）。开写：
 
 修正 main.cpp 里两处笔误（outputProc 的参数名、无用的变量），再补 Makefile 和默认配置：
 
@@ -131,7 +131,7 @@ engine/
 ├── biquad.hpp      ← RBJ cookbook 双二阶（peaking/lowshelf/highshelf），级联处理
 ├── ringbuffer.hpp  ← 无锁 SPSC 环形缓冲（溢出丢帧、欠载补零）
 ├── config.hpp      ← 行式配置解析（热加载）
-├── main.cpp        ← SystemPEQ 设备 IOProc 采集 → PEQ → 默认输出单元播放
+├── main.cpp        ← VfdPEQ 设备 IOProc 采集 → PEQ → 默认输出单元播放
 ├── peq.conf        ← 10 段默认配置（当前全 0dB = 直通）
 └── build/peq_engine
 ```
@@ -139,7 +139,7 @@ engine/
 **运行方式（需要你在终端跑）：**
 
 ```bash
-# 1. 系统设置 → 声音 → 输出，切到 "SystemPEQ 2ch"
+# 1. 系统设置 → 声音 → 输出，切到 "VfdPEQ 2ch"
 # 2. 在 engine/ 目录下：
 cd ~/prj/260929-eqmac/engine && ./build/peq_engine
 ```
@@ -150,8 +150,8 @@ cd ~/prj/260929-eqmac/engine && ./build/peq_engine
 - 终端会打印 `[peq] config reloaded (10 bands)` 确认
 
 **注意两点：**
-1. 引擎默认输出到“当前默认输出设备”，所以先切 SystemPEQ 再启动引擎（启动时的默认设备就是真实出声设备）
-2. 如果终端打出 `WARNING: sample rates differ`，说明 SystemPEQ(48k) 和真实设备采样率不一致，告诉我现象我们再处理
+1. 引擎默认输出到“当前默认输出设备”，所以先切 VfdPEQ 再启动引擎（启动时的默认设备就是真实出声设备）
+2. 如果终端打出 `WARNING: sample rates differ`，说明 VfdPEQ(48k) 和真实设备采样率不一致，告诉我现象我们再处理
 
 试一下，把两头的表现（有没有声音、切配置有没有生效）反馈给我。如果都 OK，就进阶段 3 用 Dear ImGui 做 GUI。
 
@@ -161,19 +161,19 @@ cd ~/prj/260929-eqmac/engine && ./build/peq_engine
 ## 🧑‍💻 User
 
 (py312) tkalpha@ChilloutStartup 260929-eqmac % cd ~/prj/260929-eqmac/engine && ./build/peq_engine
-[peq] SystemPEQ @ 48000 Hz -> default output @ 48000 Hz
+[peq] VfdPEQ @ 48000 Hz -> default output @ 48000 Hz
 [peq] loaded 10 bands from peq.conf
 [peq] engine running. Ctrl+C to stop. Editing peq.conf hot-reloads.  运行成功了但是似乎没有声音
 
 ---
 ## 🌋 Ark
 
-引擎跑起来了但没声——先查两处关键点：① BlackHole 流的交错格式；② 输出目标是不是指回了 SystemPEQ 自己（死循环）。
+引擎跑起来了但没声——先查两处关键点：① BlackHole 流的交错格式；② 输出目标是不是指回了 VfdPEQ 自己（死循环）。
 
 两个结论：
 
 1. **BlackHole 流格式是 interleaved**，采集侧代码没错
-2. **问题找到了：引擎把声音又送回了 SystemPEQ 自己**——你把系统输出切到 SystemPEQ 后，`defaultOutputDevice()` 返回的就是 SystemPEQ，于是音频变成 `SystemPEQ → 引擎 → SystemPEQ → ...` 的死循环，真实扬声器永远是静音的
+2. **问题找到了：引擎把声音又送回了 VfdPEQ 自己**——你把系统输出切到 VfdPEQ 后，`defaultOutputDevice()` 返回的就是 VfdPEQ，于是音频变成 `VfdPEQ → 引擎 → VfdPEQ → ...` 的死循环，真实扬声器永远是静音的
 
 修复方案：引擎启动时自动**排除虚拟设备**，找真实输出设备（优先内建，其次第一个非虚拟输出设备），并支持命令行手动指定输出设备名。改代码：
 
@@ -202,7 +202,7 @@ Available output devices:
 Select output device [Enter = 0 (外置耳机), or number]:
 ```
 
-- SystemPEQ 虚拟设备自动从候选列表排除（不会再选到自己形成死循环）
+- VfdPEQ 虚拟设备自动从候选列表排除（不会再选到自己形成死循环）
 - 推荐项自动给出（优先非虚拟的系统默认设备），**直接回车确认**，或输数字选择
 - 非数字输入会被拒绝；也可以跳过交互直接 `./build/peq_engine peq.conf "外置耳机"`
 
@@ -212,7 +212,7 @@ Select output device [Enter = 0 (外置耳机), or number]:
 cd ~/prj/260929-eqmac/engine && ./build/peq_engine
 ```
 
-选一个真实设备（比如外置耳机），系统输出保持 SystemPEQ 2ch，这次声音应该正常出来了——路径是 `应用 → SystemPEQ → 引擎(10段biquad) → 真实设备`。出声后试试改 `peq.conf` 里的 gain 热加载效果，OK 的话我们就开阶段 3 的 Dear ImGui。
+选一个真实设备（比如外置耳机），系统输出保持 VfdPEQ 2ch，这次声音应该正常出来了——路径是 `应用 → VfdPEQ → 引擎(10段biquad) → 真实设备`。出声后试试改 `peq.conf` 里的 gain 热加载效果，OK 的话我们就开阶段 3 的 Dear ImGui。
 
 ---
 ## 🧑‍💻 User
@@ -224,7 +224,7 @@ Available output devices:
   [1] MacBook Air扬声器                     built-in    44100 Hz
 Select output device [Enter = 0 (外置耳机), or number]: 0
 
-[peq] SystemPEQ @ 48000 Hz  ->  '外置耳机' @ 48000 Hz
+[peq] VfdPEQ @ 48000 Hz  ->  '外置耳机' @ 48000 Hz
 [peq] loaded 10 bands from peq.conf
 [peq] engine running. Ctrl+C to stop. Editing peq.conf hot-reloads.
 可以输出更多debug信息
@@ -232,7 +232,7 @@ Select output device [Enter = 0 (外置耳机), or number]: 0
 ---
 ## 🌋 Ark
 
-好，加一套统计 debug：每 2 秒打印输入回调数、收到的帧数、丢帧、输出欠载、环形缓冲水位——这样能立刻判断卡在哪一环（采集没进来 / 进来了没写出 / 还是压根没有 app 在往 SystemPEQ 里放声音）：
+好，加一套统计 debug：每 2 秒打印输入回调数、收到的帧数、丢帧、输出欠载、环形缓冲水位——这样能立刻判断卡在哪一环（采集没进来 / 进来了没写出 / 还是压根没有 app 在往 VfdPEQ 里放声音）：
 
 ✅ Debug 版编译完成。重新跑起来后，每 2 秒会打印一行统计：
 
@@ -245,17 +245,17 @@ cd ~/prj/260929-eqmac/engine && ./build/peq_engine
        │            │                │              │
        │            │                │              └ 输出侧缺数据的帧数（>0且持续增长=没声音的直接原因）
        │            │                └ 环形缓冲溢出丢帧
-       │            └ 采集侧实际收到的帧数（持续增长=SystemPEQ里有声音进来）
+       │            └ 采集侧实际收到的帧数（持续增长=VfdPEQ里有声音进来）
        └ 设备IOProc被调用的次数（=0说明设备IO根本没跑）
 ```
 
-**测试时请注意一个关键点**：系统输出（系统设置→声音）必须保持为 **SystemPEQ 2ch**，引擎才能截到系统音频；引擎里选的才是真正出声的设备。另外建议在音乐 App 里**暂停再播放一次**——有些 App 启动时会缓存输出设备，不会自动跟随默认设备切换。
+**测试时请注意一个关键点**：系统输出（系统设置→声音）必须保持为 **VfdPEQ 2ch**，引擎才能截到系统音频；引擎里选的才是真正出声的设备。另外建议在音乐 App 里**暂停再播放一次**——有些 App 启动时会缓存输出设备，不会自动跟随默认设备切换。
 
 跑起来放首歌，然后把几行 `[dbg]` 输出发我。根据数字会直接指向四种情况之一：
 
 | 现象 | 结论 |
 |---|---|
-| `inCB(+0)` 恒定 | SystemPEQ 设备 IO 没跑，驱动/客户端问题 |
+| `inCB(+0)` 恒定 | VfdPEQ 设备 IO 没跑，驱动/客户端问题 |
 | `frames(+0)` 但 inCB 在涨 | 数据格式不匹配（第一行 `input buffers=.. ch=..` 会暴露真相） |
 | `frames` 在涨 + `underrun` 也在涨 | 环形缓冲在丢数据，管线衔接问题 |
 | `frames` 在涨 + `underrun(+0)` | 数据都到位了，问题在输出端绑定 |
@@ -268,7 +268,7 @@ Available output devices:
   [1] MacBook Air扬声器                     built-in    44100 Hz
 Select output device [Enter = 0 (外置耳机), or number]: 0
 
-[peq] SystemPEQ @ 48000 Hz  ->  '外置耳机' @ 48000 Hz
+[peq] VfdPEQ @ 48000 Hz  ->  '外置耳机' @ 48000 Hz
 [peq] loaded 10 bands from peq.conf
 [dbg] input buffers=1  ch=2  bytes=4096
 [peq] engine running. Ctrl+C to stop. Editing peq.conf hot-reloads.
@@ -303,18 +303,18 @@ cd ~/prj/260929-eqmac/engine && ./build/peq_engine
 [dbg] inCB=..(+) frames=..(+) drop=0 underrun=..(+) | outCB=..(+) peak: in=0.5231 out=0.5231
                                                                         │          │
                                                                         │          └ 送给真实设备前的电平
-                                                                        └ 从 SystemPEQ 收到的电平
+                                                                        └ 从 VfdPEQ 收到的电平
 ```
 
 判读表：
 
 | peak: in | peak: out | 结论 |
 |---|---|---|
-| ≈0 | ≈0 | **没有声音进 SystemPEQ** —— 音乐 App 没把 SystemPEQ 当输出（重启音乐 App / 暂停再播放试试） |
+| ≈0 | ≈0 | **没有声音进 VfdPEQ** —— 音乐 App 没把 VfdPEQ 当输出（重启音乐 App / 暂停再播放试试） |
 | >0 | ≈0 | 引擎处理把声音吃掉了（biquad 状态异常）—— 我来修 |
 | >0 | >0 | 数据完整送到了输出设备 —— 问题在系统层（音量、设备路由、耳机本身） |
 
-播放音乐时把 2~3 行 `[dbg]` 发我。另外顺手确认一下：引擎跑着的时候，**系统设置的输出是否确实停在 SystemPEQ 2ch**，音乐 App 是不是处于播放中（不是暂停）。
+播放音乐时把 2~3 行 `[dbg]` 发我。另外顺手确认一下：引擎跑着的时候，**系统设置的输出是否确实停在 VfdPEQ 2ch**，音乐 App 是不是处于播放中（不是暂停）。
 
 ---
 ## 🧑‍💻 User
@@ -341,12 +341,12 @@ cd ~/prj/260929-eqmac/engine && ./build/peq_engine
 
 - `in = out` 完全一致 → 引擎管线本身**没有任何问题**，进什么出什么
 - 基线 `0.0018` ≈ 静音底噪；拖音量条时冒出 `1.68→3.38` 的尖峰 → 那是音量反馈音 + 环形缓冲陈旧数据拼接产生的咔哒声
-- **也就是说：没有任何音乐数据流入 SystemPEQ**，只有零星的系统提示音进来了
+- **也就是说：没有任何音乐数据流入 VfdPEQ**，只有零星的系统提示音进来了
 
-管线是通的，问题在**音乐 App 没有把声音发到 SystemPEQ**。做两个快速验证（引擎保持运行）：
+管线是通的，问题在**音乐 App 没有把声音发到 VfdPEQ**。做两个快速验证（引擎保持运行）：
 
 ```bash
-# 测试1：系统语音（必定走默认输出 = SystemPEQ）
+# 测试1：系统语音（必定走默认输出 = VfdPEQ）
 say -v Tingting "测试一二三"
 
 # 测试2：系统提示音
@@ -355,8 +355,8 @@ afplay /System/Library/Sounds/Ping.aiff
 
 跑的时候看 `[dbg]` 行的 `peak: in`——`say` 说话的瞬间应该冲到 0.1 以上。
 
-- **如果 `say` 有峰** → 证实系统默认输出确实是 SystemPEQ，那问题就是你的音乐 App 没跟随默认设备。告诉我你用什么听歌（Apple Music / Spotify / 浏览器 / 网易云…），大部分 App 需要**完全退出重开**（或暂停→播放）才会重新路由；有的还有自己的输出设备选择
-- **如果 `say` 也没峰** → 那默认输出其实没指向 SystemPEQ，去 系统设置→声音 确认一下选中的是 "SystemPEQ 2ch"
+- **如果 `say` 有峰** → 证实系统默认输出确实是 VfdPEQ，那问题就是你的音乐 App 没跟随默认设备。告诉我你用什么听歌（Apple Music / Spotify / 浏览器 / 网易云…），大部分 App 需要**完全退出重开**（或暂停→播放）才会重新路由；有的还有自己的输出设备选择
+- **如果 `say` 也没峰** → 那默认输出其实没指向 VfdPEQ，去 系统设置→声音 确认一下选中的是 "VfdPEQ 2ch"
 
 ---
 ## 🧑‍💻 User
@@ -386,18 +386,18 @@ afplay /System/Library/Sounds/Ping.aiff
 
 好问题——但注意：**30% 的音量是在输出设备端应用的，在我们的电平表之后**，所以就算音量 30%，引擎里看到的也应该是接近满幅的音乐波形（~0.3+），而不是 0.0032。另外 `say` 说话时也没冲峰，这不对劲。
 
-我现在怀疑一个更隐蔽的问题：**输出单元其实没绑定到耳机，而是流回了 SystemPEQ 自己**（这能同时解释：欠载恒 0、in=out 完全一致、拖音量时的尖峰还会逐窗递增 1.68→2.77→3.38 这种反馈累积特征）。先查证 BlackHole 环形缓冲空读行为，再把输出端换成“设备 IOProc 直写”的方式，彻底消除绑定歧义：
+我现在怀疑一个更隐蔽的问题：**输出单元其实没绑定到耳机，而是流回了 VfdPEQ 自己**（这能同时解释：欠载恒 0、in=out 完全一致、拖音量时的尖峰还会逐窗递增 1.68→2.77→3.38 这种反馈累积特征）。先查证 BlackHole 环形缓冲空读行为，再把输出端换成“设备 IOProc 直写”的方式，彻底消除绑定歧义：
 
 查到驱动源码里的关键行为了，两个重要事实：
 
-1. **驱动在读侧应用音量**：`SystemPEQ` 设备的音量条(30%)是在驱动里乘到数据上的，你的直觉对了一半——但音乐若在放，0.3 倍音量的峰值也该有 ~0.1+,不至于 0.0032
-2. **驱动在没有 app 写入时会主动清零**(`vDSP_vclr`)——所以恒定的 0.0032 底噪本身就可疑，它说明环形缓冲里总有数据在流动，这更像**输出回灌成了死循环**(输出单元没绑定成功、流回了 SystemPEQ 自己)，这能同时解释：欠载恒 0(自我供血)、in=out 一致、拖音量时尖峰逐窗递增(反馈累积)
+1. **驱动在读侧应用音量**：`VfdPEQ` 设备的音量条(30%)是在驱动里乘到数据上的，你的直觉对了一半——但音乐若在放，0.3 倍音量的峰值也该有 ~0.1+,不至于 0.0032
+2. **驱动在没有 app 写入时会主动清零**(`vDSP_vclr`)——所以恒定的 0.0032 底噪本身就可疑，它说明环形缓冲里总有数据在流动，这更像**输出回灌成了死循环**(输出单元没绑定成功、流回了 VfdPEQ 自己)，这能同时解释：欠载恒 0(自我供血)、in=out 一致、拖音量时尖峰逐窗递增(反馈累积)
 
 与其继续猜，做两个动作：① 输出端从 AudioUnit 换成**直接在真实设备上注册 IOProc**(和输入侧对称，零绑定歧义)；② 给你一个严格对照测试。改代码：
 
 ✅ 输出端已改为**直接在真实设备上注册 IOProc**（和输入侧完全对称，不存在绑定歧义），编译通过。请按下面协议重测——这次能一锤定音：
 
-**准备**：把 SystemPEQ 设备的音量调到 **100%**（它 30% 时驱动会在读侧把数据衰减到 3%，会严重干扰判读。方法：系统设置→声音→输出选 SystemPEQ 2ch，把音量条拉满；或在 Audio MIDI Setup 里调）。
+**准备**：把 VfdPEQ 设备的音量调到 **100%**（它 30% 时驱动会在读侧把数据衰减到 3%，会严重干扰判读。方法：系统设置→声音→输出选 VfdPEQ 2ch，把音量条拉满；或在 Audio MIDI Setup 里调）。
 
 **测试**：
 
@@ -416,9 +416,9 @@ for i in {1..10}; do afplay /System/Library/Sounds/Ping.aiff; done
 |---|---|
 | `say`/`Ping` 期间 `peak: in` 冲到 **0.1+**，且**耳机里能听到 Ping 声** | 🎉 整条链路通了！之前只是音乐 App 没路由过来 → 重启音乐 App 即可 |
 | `peak: in` 有反应，但**耳机里没声** | 输出侧还有问题 → 发我日志，我看 `outCB` 和 `peak: out` |
-| `peak: in` 完全不动 | SystemPEQ 根本没收到系统音频 → 去 系统设置→声音 确认默认输出确实是 SystemPEQ 2ch，再发我日志 |
+| `peak: in` 完全不动 | VfdPEQ 根本没收到系统音频 → 去 系统设置→声音 确认默认输出确实是 VfdPEQ 2ch，再发我日志 |
 
-顺便说明：如果你的真实设备选了 MacBook Air 扬声器（44.1kHz），和 SystemPEQ 的 48kHz 不匹配会有音调/卡顿问题，**优先选外置耳机（48kHz）测试**。
+顺便说明：如果你的真实设备选了 MacBook Air 扬声器（44.1kHz），和 VfdPEQ 的 48kHz 不匹配会有音调/卡顿问题，**优先选外置耳机（48kHz）测试**。
 
 ---
 ## 🧑‍💻 User
@@ -446,13 +446,13 @@ for i in {1..10}; do afplay /System/Library/Sounds/Ping.aiff; done
 **关于“音量叠加”——这是预期行为，不是 bug。** 现在链路是：
 
 ```
-音乐App → SystemPEQ（音量A，驱动内衰减）→ 引擎 → 外置耳机（音量B，硬件端衰减）
+音乐App → VfdPEQ（音量A，驱动内衰减）→ 引擎 → 外置耳机（音量B，硬件端衰减）
 ```
 
-总音量 = A × B。因为系统默认输出是 SystemPEQ，**键盘音量键控制的是 A**；而 B 是耳机自己的音量，需要单独设一次。推荐的使用姿势：
+总音量 = A × B。因为系统默认输出是 VfdPEQ，**键盘音量键控制的是 A**；而 B 是耳机自己的音量，需要单独设一次。推荐的使用姿势：
 
 - 外置耳机音量 B 固定在一个舒适位置（比如 60~70%），以后不动它
-- 日常用键盘音量键调 A（即 SystemPEQ 的音量，驱动里乘，不经过引擎，无失真风险）
+- 日常用键盘音量键调 A（即 VfdPEQ 的音量，驱动里乘，不经过引擎，无失真风险）
 
 这也正是 eqMac 的实际工作方式。
 
@@ -861,7 +861,7 @@ cd ~/prj/260929-eqmac/gui && ./build/peq_gui
 | 声量 + 峰值 | ✅ L/R 双声道 VU+Peak 计，叠在点阵屏底部（暗条身+亮条头） |
 | EQ FR 曲线 | ✅ ImPlot 对数轴：高亮绿色合成曲线 + 低亮度单 band 曲线 |
 | 10 段控制 | ✅ 每行：使能 ✓ / LS·PK·HS 点按循环 / Freq·Gain·Q 拖拽，**双击滑块可直接输入数值** |
-| 设备音量条 ×2 | ✅ 顶部：`PEQ input volume`（SystemPEQ 驱动内衰减）+ `Output device volume`（从 engine.status 自动识别真实设备；若引擎未跑可手动选） |
+| 设备音量条 ×2 | ✅ 顶部：`PEQ input volume`（VfdPEQ 驱动内衰减）+ `Output device volume`（从 engine.status 自动识别真实设备；若引擎未跑可手动选） |
 | 参数下发 | ✅ 改动 0.3s 后自动写 `peq.conf` → 引擎 ~1s 热加载 |
 
 跑起来看看，重点反馈：VFD 频谱有没有随音乐跳动、音量条是否双向同步（外部改音量 GUI 会不会跟随）、FR 曲线形状是否合理。之后可以做预设系统（保存/加载 JSON）、更多 VFD 主题、以及把 debug 统计收敛成状态栏。
@@ -895,7 +895,7 @@ cd ~/prj/260929-eqmac/gui && ./build/peq_gui
 3. **布局改为单列纵向堆叠**：
    ```
    ┌─────────────────────────────────────┐
-   │ IN: SystemPEQ ──────── OUT: 外置耳机 │ ← 设备栏 + 双音量条
+   │ IN: VfdPEQ ──────── OUT: 外置耳机 │ ← 设备栏 + 双音量条
    ├──────────────────┬──────────────────┤
    │                  │                  │
    │   VFD 频谱       │   PEQ FR 曲线    │ ← 等高并排（VFD 按高度等比缩放）
@@ -1022,11 +1022,11 @@ read 结果和真实文件对上了：main.mm 还处于**双屏状态**（本轮
 ### 架构
 
 ```
-[App] → SystemPEQ 2ch (HAL 驱动, dev/systempeq.hal)
+[App] → VfdPEQ 2ch (HAL 驱动, dev/vfdpeq.hal)
               │ AudioDeviceIOProc 采集
               ▼
         engine (C++): RBJ biquad 级联 → 无锁环形缓冲 → 真实输出设备
-              │ 共享内存 /systempeq_audio (频谱+电平馈送)
+              │ 共享内存 /vfdpeq_audio (频谱+电平馈送)
               ▼
         gui (Obj-C++/Metal): Dear ImGui + VfdSpecturm 点阵渲染器
 ```
@@ -1042,7 +1042,7 @@ read 结果和真实文件对上了：main.mm 还处于**双屏状态**（本轮
 
 ```bash
 # 1. 驱动（一次性，需 sudo）
-cd driver && make && sudo ../scripts/install.sh   # 系统设置里选 SystemPEQ 2ch 为输出
+cd driver && make && sudo ../scripts/install.sh   # 系统设置里选 VfdPEQ 2ch 为输出
 
 # 2. 引擎
 cd engine && make && ./build/peq_engine           # 首次会引导选择真实输出设备
@@ -1054,7 +1054,7 @@ cd gui && make && ./build/peq_gui
 ### 已知边界
 
 - 采样率不匹配的输出设备会有音调偏移（建议 48kHz 设备）
-- 音量叠加是预期行为：键盘音量控制 SystemPEQ 输入级，真实设备音量固定一次
+- 音量叠加是预期行为：键盘音量控制 VfdPEQ 输入级，真实设备音量固定一次
 - GUI 设备名中文显示为 `?`（ProggyClean 无 CJK 字形，暂不阻塞）
 
 ### Roadmap
@@ -1134,7 +1134,7 @@ cd ~/prj/260929-eqmac/gui && ./build/peq_gui
 截图信息量很大，三个问题都定位到了：
 
 1. **引擎日志里明确写着 `shm create failed, GUI spectrum unavailable`**——引擎没建成共享内存，GUI 自然没有频谱/声量计数据（FR 曲线正常，因为它只依赖配置不依赖音频）
-2. **采样率不匹配**：`SystemPEQ @ 48000 → MacBook Air扬声器 @ 44100`，且日志里 `drop` 持续增长（环形缓冲溢出）
+2. **采样率不匹配**：`VfdPEQ @ 48000 → MacBook Air扬声器 @ 44100`，且日志里 `drop` 持续增长（环形缓冲溢出）
 3. 左侧刻度太密
 
 先做两个诊断：shm 对象到底建没建、engine.status 写没写：
@@ -1142,12 +1142,12 @@ cd ~/prj/260929-eqmac/gui && ./build/peq_gui
 截图信息非常关键，三个问题根因都清楚了：
 
 1. **引擎日志里明确写着 `shm create failed, GUI spectrum unavailable`**——共享内存创建失败，GUI 拿不到音频数据，所以声量计和频谱是死的；而 FR 曲线正常（它只依赖配置不依赖音频）——完全吻合
-2. **采样率不匹配**：`SystemPEQ @ 48000 → MacBook Air扬声器 @ 44100`，且日志里 `drop` 持续增长（37888 还在涨）——环形缓冲漂移溢出，需要让引擎启动时把 SystemPEQ 的标称采样率设成和真实设备一致
+2. **采样率不匹配**：`VfdPEQ @ 48000 → MacBook Air扬声器 @ 44100`，且日志里 `drop` 持续增长（37888 还在涨）——环形缓冲漂移溢出，需要让引擎启动时把 VfdPEQ 的标称采样率设成和真实设备一致
 3. 左侧刻度：FR 区网格步进是 6dB，改稀到 12dB
 
 先读引擎侧相关代码的精确原文：
 
-两个 grep 都精确命中——引擎确实带 shm 代码但运行时创建失败（原因未知，需要 errno），engine.status 也正常写出了（内容都对）。现在需要：① 给 shm 失败加 errno 诊断；② 引擎启动时把 SystemPEQ 采样率对齐真实设备（顺带解决 drop 漂移）；③ FR 刻度改 12dB 步进；④ GUI 音量条绑定失败时打日志。先读引擎相关区域的精确原文：
+两个 grep 都精确命中——引擎确实带 shm 代码但运行时创建失败（原因未知，需要 errno），engine.status 也正常写出了（内容都对）。现在需要：① 给 shm 失败加 errno 诊断；② 引擎启动时把 VfdPEQ 采样率对齐真实设备（顺带解决 drop 漂移）；③ FR 刻度改 12dB 步进；④ GUI 音量条绑定失败时打日志。先读引擎相关区域的精确原文：
 
 原文确认。现在打四组补丁——shm errno 诊断、采样率对齐、刻度步进、GUI 音量绑定日志：
 
@@ -1216,27 +1216,27 @@ resources
 src
 
 /Users/tkalpha/prj/260929-eqmac/driver/build:
-SystemPEQ.driver
+VfdPEQ.driver
 
-/Users/tkalpha/prj/260929-eqmac/driver/build/SystemPEQ.driver:
+/Users/tkalpha/prj/260929-eqmac/driver/build/VfdPEQ.driver:
 Contents
 
-/Users/tkalpha/prj/260929-eqmac/driver/build/SystemPEQ.driver/Contents:
+/Users/tkalpha/prj/260929-eqmac/driver/build/VfdPEQ.driver/Contents:
 _CodeSignature
 Info.plist
 MacOS
 
-/Users/tkalpha/prj/260929-eqmac/driver/build/SystemPEQ.driver/Contents/_CodeSignature:
+/Users/tkalpha/prj/260929-eqmac/driver/build/VfdPEQ.driver/Contents/_CodeSignature:
 CodeResources
 
-/Users/tkalpha/prj/260929-eqmac/driver/build/SystemPEQ.driver/Contents/MacOS:
-SystemPEQ
+/Users/tkalpha/prj/260929-eqmac/driver/build/VfdPEQ.driver/Contents/MacOS:
+VfdPEQ
 
 /Users/tkalpha/prj/260929-eqmac/driver/resources:
 Info.plist
 
 /Users/tkalpha/prj/260929-eqmac/driver/src:
-SystemPEQ.c
+VfdPEQ.c
 
 /Users/tkalpha/prj/260929-eqmac/engine:
 biquad.hpp
@@ -1325,9 +1325,9 @@ cd ~/prj/260929-eqmac/engine && ./build/peq_engine
 ```
 
 启动日志重点看三行：
-- `[peq] SystemPEQ nominal rate set to 44100 Hz (matched output)` —— 采样率对齐成功（音调偏移和 drop 漂移会一起消失）
+- `[peq] VfdPEQ nominal rate set to 44100 Hz (matched output)` —— 采样率对齐成功（音调偏移和 drop 漂移会一起消失）
 - 如果还是 `[shm] ... failed: <原因>` —— 这次会带 errno 具体原因，贴给我
-- `[peq] SystemPEQ nominal rate set to ... (err N)` —— 如果设置采样率被拒绝，错误码给我
+- `[peq] VfdPEQ nominal rate set to ... (err N)` —— 如果设置采样率被拒绝，错误码给我
 
 **2. 重启 GUI**：
 
@@ -1336,7 +1336,7 @@ cd ~/prj/260929-eqmac/gui && ./build/peq_gui
 ```
 
 终端会多几行诊断日志：
-- `[gui] IN bind: dev=0x... has=... vol=...` —— SystemPEQ 音量条绑定结果
+- `[gui] IN bind: dev=0x... has=... vol=...` —— VfdPEQ 音量条绑定结果
 - `[gui] engine.status: 'MacBook Air扬声器' -> dev=0x...` + `[gui] OUT bind: has=...` —— 输出设备绑定结果
 - 如果 shm 通了，频谱和声量计应该立即活过来
 
@@ -1358,7 +1358,7 @@ cd ~/prj/260929-eqmac/gui && ./build/peq_gui
 
 shm_open 本身在这台 Mac 上完全正常。那问题在引擎侧——我自己拉起引擎抓启动日志：
 
-**真相大白的第一步**：`shm_open(/systempeq_audio) failed: Invalid argument` (EINVAL)！而我刚才的 shmtest 用**完全相同的 flags 却成功了**——唯一区别是引擎的 shm 对象可能已经存在（历史残留）且正被 GUI 映射。验证这个假设——对**已存在且被映射的对象**再 O_TRUNC 打开会怎样：
+**真相大白的第一步**：`shm_open(/vfdpeq_audio) failed: Invalid argument` (EINVAL)！而我刚才的 shmtest 用**完全相同的 flags 却成功了**——唯一区别是引擎的 shm 对象可能已经存在（历史残留）且正被 GUI 映射。验证这个假设——对**已存在且被映射的对象**再 O_TRUNC 打开会怎样：
 
 **根因抓到了！** macOS 的坑：对**已被其他进程 mmap 的 shm 对象**再以 `O_TRUNC` 打开会返回 `EINVAL`（errno=22，实测复现）。因果链：旧引擎创建的对象一直被 GUI 持有映射 → 引擎重启时 create 永远失败 → GUI 挂着的是无写入者的旧对象 → 声量计/频谱死。
 
@@ -1373,7 +1373,7 @@ shm_open 本身在这台 Mac 上完全正常。那问题在引擎侧——我自
 | # | 事实 | 状态 |
 |---|---|---|
 | 1 | 采样率对齐补丁已生效：引擎日志 `44288帧/2s ≈ 44.1kHz`、`drop=0` 恒定 | ✅ 已修复 |
-| 2 | 引擎日志 `[shm] shm_open(/systempeq_audio) failed: Invalid argument` | ❌ 待修 |
+| 2 | 引擎日志 `[shm] shm_open(/vfdpeq_audio) failed: Invalid argument` | ❌ 待修 |
 | 3 | 我的独立测试证明这台 Mac 上 shm_open 本身正常 | 排除系统问题 |
 | 4 | **根因（高置信）**：macOS 对“正被其他进程 mmap 的 shm 对象"再 `O_TRUNC` 打开会返回 EINVAL——旧 GUI 还持着上一次引擎创建的旧对象映射，引擎重启时 create 永远失败 | 待修 |
 | 5 | 声量计/频谱死 = GUI 拿不到音频数据（shm 断），FR 曲线正常（只依赖配置）| 与 #2 同源 |

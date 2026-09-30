@@ -1,4 +1,4 @@
-# SystemPEQ engine — clang++, no external deps
+# VfdPEQ engine — clang++, no external deps
 CXX      := clang++
 SDK      := $(shell xcrun --show-sdk-path)
 BUILD    := build
