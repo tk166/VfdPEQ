@@ -28,8 +28,12 @@
 #include "../common/shm_ring.hpp"
 #include "../common/dbglog.h"   // debug
 
-static constexpr size_t kRingCapacity = 1 << 15; // 32768 frames ~= 0.68s @48k
+static constexpr size_t kRingCapacity = 1 << 17; // 131072 frames ~= 0.68s @192k
 static constexpr int    kChannels     = 2;
+// debug: 架构决策（用户批准）——SystemPEQ 固定 192kHz 不跟随输出设备，
+// 输出侧用 Core Audio SRC（AudioConverter）转换到目标设备采样率。
+// 消除驱动 nominal rate 反复重设（44.1<->48 翻转）引发的 overload/churn 与速率失配 underrun。
+static constexpr int    kVirtualRate  = 192000;
 
 struct Engine {
     FrameRingBuffer      rb{kRingCapacity, kChannels};
@@ -58,6 +62,10 @@ struct Engine {
     std::atomic<bool>    devicesChanged{false};  // CoreAudio 设备列表变化 → 主循环检查失联
     std::atomic<bool>    confReloadRequested{false};  // debug: IOProc 置位 → 主循环热加载
     std::atomic<time_t>  lastRebindAt{0};        // debug: rebind 完成时间（抑制乒乓：完成后 3s 内跳过失联检查）
+    // debug: SRC（Core Audio AudioConverter）——rb(192k) -> 目标设备采样率
+    AudioConverterRef    conv        = nullptr;
+    Float64              convOutRate = 0.0;      // converter 当前输出采样率（变化时重建）
+    std::mutex           convMx;                 // converter 重建与 outProc 使用的互斥
     // debug counters
     std::atomic<uint64_t> inCB{0}, inFramesGot{0}, inFramesDropped{0}, outUnderrunFrames{0}, outCB{0};
     std::atomic<float>    inPeak{0.0f}, outPeak{0.0f};
@@ -235,6 +243,60 @@ static OSStatus inputProc(AudioObjectID /*inDevice*/, const AudioTimeStamp* /*no
     return noErr;
 }
 
+// ---------- SRC (Core Audio AudioConverter): rb(192k) -> target device rate ----------
+struct ConvCtx { FrameRingBuffer* rb; };
+
+// AudioConverter 的输入回调：按需从 rb 拉取 192k 帧；欠载填静音（保持转换节奏）
+static OSStatus convInputCb(AudioConverterRef /*conv*/, UInt32* ioNumPackets,
+                            AudioBufferList* ioData,
+                            AudioStreamPacketDescription** /*outPacketDesc*/, void* inUserData) {
+    auto* ctx = static_cast<ConvCtx*>(inUserData);
+    AudioBuffer& ab = ioData->mBuffers[0];
+    const UInt32 wantFrames = *ioNumPackets;
+    const UInt32 capFrames  = (UInt32)(ab.mDataByteSize / (sizeof(float) * kChannels));
+    const UInt32 n = wantFrames < capFrames ? wantFrames : capFrames;
+    float* dst = static_cast<float*>(ab.mData);
+    const size_t got = ctx->rb->read(dst, n);
+    if (got < n)  // underrun: 静音补齐，converter 节奏不受影响
+        std::memset(dst + got * kChannels, 0, (n - got) * kChannels * sizeof(float));
+    ab.mNumberChannels   = kChannels;
+    ab.mDataByteSize     = n * kChannels * sizeof(float);
+    *ioNumPackets        = n;
+    if (ioData->mNumberBuffers > 1)   // 单 buffer 布局
+        for (UInt32 b = 1; b < ioData->mNumberBuffers; ++b) ioData->mBuffers[b].mDataByteSize = 0;
+    return noErr;
+}
+
+static AudioStreamBasicDescription makeASBD(Float64 rate) {
+    AudioStreamBasicDescription a{};
+    a.mSampleRate       = rate;
+    a.mFormatID         = kAudioFormatLinearPCM;
+    a.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    a.mBytesPerPacket   = sizeof(float) * kChannels;
+    a.mFramesPerPacket  = 1;
+    a.mBytesPerFrame    = sizeof(float) * kChannels;
+    a.mChannelsPerFrame = kChannels;
+    a.mBitsPerChannel   = 32;
+    return a;
+}
+
+// 按（新的）目标设备采样率重建 converter——rebind 与启动时调用（此时输出 IO 已停止）
+static void rebuildConverter(Engine& e, Float64 targetRate) {
+    std::lock_guard<std::mutex> lk(e.convMx);
+    if (e.conv && e.convOutRate == targetRate) return;   // 目标 rate 未变，复用
+    if (e.conv) { AudioConverterDispose(e.conv); e.conv = nullptr; }
+    AudioStreamBasicDescription inASBD = makeASBD(kVirtualRate);
+    AudioStreamBasicDescription outASBD = makeASBD(targetRate);
+    OSStatus st = AudioConverterNew(&inASBD, &outASBD, &e.conv);
+    if (st != noErr) {
+        peq_dbg("[peq] ERROR: AudioConverterNew failed %d", (int)st);   // debug
+        e.conv = nullptr;
+        return;
+    }
+    e.convOutRate = targetRate;
+    peq_dbg("[peq] SRC converter ready: %d -> %d Hz", (int)kVirtualRate, (int)targetRate);   // debug
+}
+
 // ---------- output side: IOProc on the REAL device ----------
 static OSStatus outputDeviceProc(AudioObjectID /*inDevice*/, const AudioTimeStamp* /*now*/,
                                  const AudioBufferList* /*inInputData*/, const AudioTimeStamp* /*inTime*/,
@@ -249,12 +311,35 @@ static OSStatus outputDeviceProc(AudioObjectID /*inDevice*/, const AudioTimeStam
     static thread_local std::vector<float> tmp;
     tmp.resize(nFrames * kChannels);
 
-    size_t got = e->rb.read(tmp.data(), nFrames);
-    e->outCB.fetch_add(1, std::memory_order_relaxed);
-    if (got < nFrames) { // underrun: zero-fill the tail
-        e->outUnderrunFrames.fetch_add(nFrames - got, std::memory_order_relaxed);
-        std::memset(tmp.data() + got * kChannels, 0, (nFrames - got) * kChannels * sizeof(float));
+    // debug: 输出读取路径二选一——有 converter 走 SRC（rb 192k -> target），无则直读（降级）
+    {
+        std::lock_guard<std::mutex> lk(e->convMx);
+        if (e->conv) {
+            ConvCtx ctx{&e->rb};
+            UInt32 packets = nFrames;
+            AudioBufferList convOut;
+            convOut.mNumberBuffers = 1;
+            convOut.mBuffers[0].mNumberChannels = kChannels;
+            convOut.mBuffers[0].mDataByteSize = nFrames * kChannels * sizeof(float);
+            convOut.mBuffers[0].mData = tmp.data();
+            OSStatus st = AudioConverterFillComplexBuffer(e->conv, convInputCb, &ctx, &packets,
+                                                          &convOut, nullptr);
+            if (st != noErr && st != kAudioConverterErr_InvalidInputSize)
+                peq_dbg("[peq] SRC fill err %d (got %u/%u frames)", (int)st, (unsigned)packets, (unsigned)nFrames);   // debug
+            if (packets < nFrames)   // converter 供给不足：尾部静音（ring 欠载时 converter 回调已填静音，双保险）
+                std::memset(tmp.data() + packets * kChannels, 0,
+                            (nFrames - packets) * kChannels * sizeof(float));
+            e->outUnderrunFrames.fetch_add(nFrames - packets, std::memory_order_relaxed);
+        } else {
+            // 降级路径（converter 未就绪）：直读 rb（仅启动瞬间可能出现）
+            size_t got = e->rb.read(tmp.data(), nFrames);
+            if (got < nFrames) {
+                e->outUnderrunFrames.fetch_add(nFrames - got, std::memory_order_relaxed);
+                std::memset(tmp.data() + got * kChannels, 0, (nFrames - got) * kChannels * sizeof(float));
+            }
+        }
     }
+    e->outCB.fetch_add(1, std::memory_order_relaxed);
 
     e->peq[0].processInterleaved(tmp.data(), nFrames, kChannels);
 
@@ -366,17 +451,11 @@ static void rebindToDevice(Engine& e, AudioDeviceID nd) {
         e.outProc = nullptr;
     }
 
-    // 3. 重对齐 VfdPEQ 标称采样率到新设备（IO 已停，失败则重试）
+    // debug: 3. 架构决策（用户批准）——SystemPEQ 固定 192k，不再重对齐到输出设备。
+    // rate 翻转（44.1<->48）是驱动 IO 卡死 / overload 风暴 / underrun 的共同诱因。
+    // 输出侧改用 Core Audio SRC 转换到目标设备采样率。
     const Float64 rRate = deviceSampleRate(nd);
-    Float64 vRate = deviceSampleRate(e.virtualDev);
-    if (vRate != rRate) {
-        if (alignVirtualRate(e, rRate)) {
-            vRate = deviceSampleRate(e.virtualDev);
-            peq_dbg("[peq] VfdPEQ rate realigned to %.0f Hz", vRate);
-        } else {
-            peq_dbg("[peq] WARNING: rate realign failed; expect pitch/drop artifacts");
-        }
-    }
+    rebuildConverter(e, rRate);   // debug: SRC converter 按（新的）目标 rate 重建
 
     // 4. 绑定并启动新输出；失败则尽力恢复旧设备
     e.realDev = nd;
@@ -391,12 +470,12 @@ static void rebindToDevice(Engine& e, AudioDeviceID nd) {
         if (ok) peq_dbg("[peq] restored output '%s'", deviceName(oldDev).c_str());
     }
 
-    // 5. 重启输入（此时输入输出采样率一致，环形缓冲重新平衡）
+    // 5. 重启输入（SystemPEQ 固定 192k，SRC 负责到目标 rate 的转换，环形缓冲重新平衡）
     AudioDeviceStart(e.virtualDev, e.inProc);
 
     if (ok) {
         e.curOutputName = deviceName(e.realDev);
-        writeEngineStatus(e, vRate, rRate);
+        writeEngineStatus(e, (Float64)kVirtualRate, rRate);
         peq_dbg("rebind DONE: '%s' @ %.0f Hz", deviceName(e.realDev).c_str(), rRate);   // debug
         peq_dbg("[peq] output now '%s' @ %.0f Hz", deviceName(e.realDev).c_str(), rRate);
     } else {
@@ -524,30 +603,30 @@ int main(int argc, char** argv) {
     fprintf(stderr, "\n[peq] VfdPEQ @ %.0f Hz  ->  '%s' @ %.0f Hz\n",
             vRate, deviceName(realDev).c_str(), rRate);
 
-    // 把 VfdPEQ 标称采样率对齐到真实设备：消除音调偏移和环形缓冲漂移丢帧
-    if (vRate != rRate) {
-        if (alignVirtualRate(e, rRate)) {
-            vRate = deviceSampleRate(e.virtualDev);
-            peq_dbg("[peq] VfdPEQ nominal rate set to %.0f Hz (matched output)", vRate);
-        } else {
-            peq_dbg("[peq] WARNING: cannot change VfdPEQ rate to %.0f Hz", rRate);
-        }
+    // debug: 架构决策（用户批准）——SystemPEQ 固定 192kHz，输出侧用 Core Audio SRC
+    // 转换到目标设备采样率；不再跟随输出设备重对齐（rate 翻转是 overload/churn/underrun 的共同诱因）
+    vRate = (Float64)kVirtualRate;
+    if (alignVirtualRate(e, kVirtualRate)) {
+        vRate = deviceSampleRate(e.virtualDev);
+        peq_dbg("[peq] SystemPEQ nominal rate fixed at %.0f Hz", vRate);   // debug
+    } else {
+        peq_dbg("[peq] WARNING: SystemPEQ 192k align failed (running at %.0f Hz); SRC input rate mismatch", vRate);   // debug
     }
 
     // status file for the GUI (device binding + volume sliders)
     writeEngineStatus(e, vRate, rRate);
-    if (vRate != rRate)
-        peq_dbg("[peq] WARNING: sample rates differ; expect pitch/speed artifacts");
 
     // ---- initial config ----
+    // debug: EQ 系数采样率 = 输出设备 rate（EQ 在 SRC 之后的目标 rate 域做）
     struct stat st{};
     if (stat(e.confPath.c_str(), &st) == 0) e.confMtime = st.st_mtime;
-    e.setCfg(loadConfig(e.confPath.c_str(), (int)vRate));
+    rebuildConverter(e, rRate);   // debug: 启动即建 SRC converter（目标 = 初始输出设备）
+    e.setCfg(loadConfig(e.confPath.c_str(), (int)rRate));
     auto initCfg = e.getCfg();
     if (!initCfg) {
         peq_dbg("[peq] WARNING: %s not found, starting bypass (0 bands)", e.confPath.c_str());
         auto bypass = std::make_shared<PEQConfig>();
-        bypass->sampleRate = (int)vRate;
+        bypass->sampleRate = (int)rRate;
         e.setCfg(bypass);
         initCfg = e.getCfg();
     } else {
@@ -595,7 +674,9 @@ int main(int argc, char** argv) {
             if (stat(e.confPath.c_str(), &st) == 0 && st.st_mtime != e.confMtime) {
                 e.confMtime = st.st_mtime;
                 peq_dbg("hot-reload: loadConfig begin");   // debug
-                if (auto cfg = loadConfig(e.confPath.c_str(), (int)deviceSampleRate(e.virtualDev))) {
+                if (auto cfg = loadConfig(e.confPath.c_str(),
+                                          (int)(e.realDev != kAudioObjectUnknown ? deviceSampleRate(e.realDev)
+                                                                                 : (Float64)kVirtualRate))) {
                     for (auto& p : e.peq) p.prepare(cfg, kChannels);
                     e.setCfg(cfg);
                     peq_dbg("hot-reload: config reloaded (L=%zu R=%zu lr=%d preamp=%.1f/%.1f bypass=%d)",

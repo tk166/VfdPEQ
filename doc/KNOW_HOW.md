@@ -113,6 +113,14 @@
 8. **僵尸进程识别**：bash 后台任务不 reap，`kill -0`/`pgrep` 对僵尸返回真——存活检查用 `ps -o stat=`（STAT 含 Z 即僵尸）。
 9. **对照实验先行**：验证"X 坏了"之前先验证"已知良好的场景还通不通"（本项目最后靠用户的现场演示才纠正方向）。**自定义测试探针（直接设备 IO 写）的数据行为与真实应用（系统路由）不同，不能互相当金标准**。
 10. **git worktree 隔离实验**：`git worktree add /tmp/v11test <commit>` 可以在不污染当前工作区的前提下构建运行任意历史版本做 A/B 对照。
+11. **冻结进程抓栈**：`sample <pid> 2 -file out.txt`（coreaudiod 等 root 进程需 osascript 提权）——主线程栈直接指明冻结点，比推理快一个数量级。本项目实例：GUI 冻结 = 主线程停在 `HALSystem::InitializeDevices()` 的 `mach_msg`（等 coreaudiod IPC 回复，永不返回）。
+12. **coreaudiod 坏状态三征兆**：① CPU 持续 >100%（ps 的 %CPU）；② `system_profiler SPAudioDataType` 挂起（60s 超时）；③ 一切 CoreAudio 查询悬挂（新进程的 HAL 初始化永不完成）。**killall 重建无效 = 深层状态损坏，重启电脑才能清**。
+13. **驱动隔离法**：`mv` 驱动 bundle 出 `/Library/Audio/Plug-Ins/HAL/` + killall coreaudiod → 系统恢复 = 该驱动是元凶。多个第三方驱动并存时逐个隔离定位。注意 bundle 被删但 coreaudiod 未重启时，内存实例仍在——"删了还在"的设备来自残留实例。
+14. **驱动 A/B 对照定责**：git worktree 构建两个版本的驱动分别安装观察 coreaudiod。本项目实测：v1.1 驱动正常（0.4% CPU）vs 改名驱动死循环（140%）→ 与设备 UID 字符串相关的系统层问题（macOS 26.5.2），与驱动功能代码无关（diff 仅有改名）。
+15. **NSMenu 模态跟踪与连续渲染冲突**：`popUpMenuPositioningItem` 的模态跟踪阻塞 MTKView draw——窗口内使用时表现为"弹窗期间 GUI 绘制暂停"。窗口内菜单优先选非模态方案；若用 NSMenu，跟踪结束后的渲染恢复要验证。
+16. **托盘菜单跟踪后的 ImGui 输入残留（待验证）**：NSMenu 跟踪结束后 ImGui 疑似出现鼠标状态残留，症状 = hover 全灭 + `WantCaptureMouse` 悬空为 1（鼠标明明在控件上）。假设修复方向：菜单回调后显式 `io.AddMouseButtonEvent(0,false)` 复位。**尚未验证**——见 BAD_CASES F3 的归因教训：先验证再修。
+17. **boot 探针**：main() 每个关键步骤一条日志（dbglog 直写文件，stderr 重定向到文件会全缓冲不可靠）——启动卡死一步定位。本项目实例：boot 10 后无 11/12 = 卡在 traySetup 的 CoreAudio 调用。
+18. **探针两条纪律**：① 帧级状态探针必须每帧重置（残留值会把"无命中"显示成"命中旧值"，误导归因）；② 给用户的诊断命令要覆盖全部预期行（`grep "mouse: DOWN"` 会漏掉 UP 行，得出"按键卡住"的假象）。
 
 ---
 

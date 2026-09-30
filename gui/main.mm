@@ -40,6 +40,10 @@
 #include "../common/dbglog.h"   // debug
 #include "vfd/vfd_render.h"
 
+// debug: 设备切换权威期与选择回调的前置声明（refreshEngineStatus @L269 先于定义使用）
+static double g_confAuthorityUntil = 0.0;
+static void deviceSelect(NSString* name);
+
 // ---------------------------------------------------------------- state
 static peqconf::Conf g_conf;                 // 全部持久状态（bypass/preamp/lrMode/output/bands）
 static int   g_curCh = 0;                    // L/R 模式下正在编辑的声道（0=L 1=R）
@@ -264,7 +268,11 @@ static void refreshEngineStatus() {
     }
     fclose(f);
     // 引擎实际绑定与配置不一致（引擎失联自动降级后）→ 配置跟随引擎实际状态
-    if (!outName.empty() && outName != g_conf.outputName && g_conf.outputName != "OFF") {
+    // debug: 权威期内跳过——deviceSelect 后引擎 status 落后于 conf 是 rebind 进行中的正常现象，
+    // 此窗口内同步会把用户选择覆盖回旧设备（实测切换"失败"的根因）
+    if (ImGui::GetTime() < g_confAuthorityUntil) {
+        peq_dbg("sync deferred: within user-authority window");   // debug
+    } else if (!outName.empty() && outName != g_conf.outputName && g_conf.outputName != "OFF") {
         g_conf.outputName = outName;
         g_dirtySave = true;
         fprintf(stderr, "[gui] output device config synced to engine: '%s'\n", outName.c_str());
@@ -562,6 +570,9 @@ static void drawCtlSlider(const CtlRect& r, float frac01, const std::string& lab
 }
 
 // 热区：更新悬停辉光 + 通用拖动量（左/下滑减小，右/上滑增大），返回归一化 d∈约[-1,1]
+// debug: hover 命中追踪
+static const char* g_lastHoverName = "(none)";
+static bool g_mainBeginOk = false;   // debug: Begin 返回值（false = 窗口被 skip，全部交互失效）
 static bool ctlHotzone(const char* id, const CtlRect& r, CtlGlow& g, double dt, float& dnorm,
                        bool& active) {
     const float c = (float)cellPx();
@@ -569,6 +580,8 @@ static bool ctlHotzone(const char* id, const CtlRect& r, CtlGlow& g, double dt, 
     const ImVec2 sz((r.x1 - r.x0 + 1) * c, (r.y1 - r.y0 + 1) * c);
     ImGui::SetCursorScreenPos(p0);
     ImGui::InvisibleButton(id, sz);
+    if (ImGui::IsItemHovered()) g_lastHoverName = id;   // debug
+    if (ImGui::IsItemClicked(0)) peq_dbg("click: %s at (%.0f,%.0f)", id, ImGui::GetIO().MousePos.x, ImGui::GetIO().MousePos.y);   // debug
     active = ImGui::IsItemActive();
     const bool hovered = ImGui::IsItemHovered();
     const float target = (hovered || active) ? 1.0f : 0.0f;
@@ -980,10 +993,13 @@ static void drawControlInteractions(double dt) {
             peq_dbg("ui: DEVICE> menu opened (%zu devices)", devList.size());   // debug
         }
         if (ImGui::BeginPopup("devmenu")) {
+            // debug: BeginPopup 成功即记录一次（打开状态可见）
+            static bool devMenuLogged = false;
+            if (!devMenuLogged) { devMenuLogged = true; peq_dbg("ui: devmenu popup ACTIVE");   // debug
+            }
             for (auto& kv : devList) {
                 if (ImGui::MenuItem(kv.second.c_str())) {
-                    g_conf.outputName = kv.second;
-                    g_dirtySave = true;
+                    deviceSelect([NSString stringWithUTF8String:kv.second.c_str()]);   // debug: 统一路径（SWITCHING/权威期/Core 拉起全套）
                 }
             }
             ImGui::EndPopup();
@@ -1138,6 +1154,8 @@ static bool          g_coreBusy = false;
 static bool          g_appTerminating = false;
 static volatile bool g_quitRequested = false;   // 信号置位，帧边界执行退出
 static bool g_devicesChangedFlag = false;       // 设备变化置位，主线程节流处理
+// debug: g_confAuthorityUntil 见文件头声明——权威期内引擎 status 落后于 conf 是
+// rebind 进行中的正常现象，禁止 status→conf 同步（否则覆盖用户选择，实测切换"失败"根因）
 static double g_lastDeviceCheck = 0;
 // debug: CoreAudio 设备缓存——主线程零 CoreAudio 枚举调用（设备变化期 CoreAudio 内部锁
 // 会让枚举调用秒级阻塞主线程，导致鼠标点击全部丢失）。缓存由后台队列刷新。
@@ -1176,6 +1194,7 @@ static AudioDeviceID findDeviceByNameCached(const std::string& name) {
 static volatile int g_enginePid = 0;            // debug: 引擎 pid（信号 handler 应急停止用，kill 是 signal-safe 的）   // 终止中的回调一律早退（NSStatusItem 已被 teardown）
 
 static void ensureSystemOutputIsPEQ();   // 前置声明（terminationHandler 里调用）
+static void deviceSelect(NSString* name);   // debug: 前置声明（DEVICE popup 选择回调）
 static void startDrvLogStream();          // debug
 static void stopDrvLogStream();           // debug
 
@@ -1383,6 +1402,7 @@ static void deviceSelect(NSString* name) {
     peq_dbg("deviceSelect: '%s' (engineAlive=%d coreBusy=%d driverInstalled=%d)",   // debug
             name.UTF8String, engineAlive() ? 1 : 0, g_coreBusy ? 1 : 0, driverInstalled() ? 1 : 0);
     g_deviceSwitchingUntil = ImGui::GetTime() + 2.5;
+    g_confAuthorityUntil = ImGui::GetTime() + 3.0;   // debug
     g_conf.outputName = name.UTF8String;
     g_dirtySave = true;
     peqconf::save(g_confPath.c_str(), g_conf);      // 立即落盘（不依赖 draw 循环）
@@ -1625,9 +1645,11 @@ static void drawFrame(id<MTLDevice> device) {
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 10));
-    ImGui::Begin("VfdPEQ", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+    // debug: beginOk——托盘 NSMenu 跟踪后疑似窗口路由异常，此探针记录 ImGui 对主窗口的判定
+    const bool beginOk = ImGui::Begin("VfdPEQ", nullptr,
+                                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                          ImGuiWindowFlags_NoBringToFrontOnFocus);
+    g_mainBeginOk = beginOk;
 
     // 组合大屏：图形区 + 控件区同屏等宽
     ImGui::Image((ImTextureID)(__bridge void*)g_screenTex,
@@ -1673,6 +1695,19 @@ static void drawFrame(id<MTLDevice> device) {
                               lv, lp, rv, rp);
         }
     }
+
+    // debug: hover 命中汇总 + ImGui 窗口状态（2s 限频，鼠标在窗口内才打）
+    {
+        const ImGuiIO& mio0 = ImGui::GetIO();
+        static double lastHoverLog = 0;
+        if (now - lastHoverLog > 2.0 && mio0.MousePos.x > -10000) {
+            lastHoverLog = now;
+            peq_dbg("hover: over='%s' capture=%d mouse=(%.0f,%.0f) winHovered=%d beginOk=%d",   // debug
+                    g_lastHoverName, (int)mio0.WantCaptureMouse, mio0.MousePos.x, mio0.MousePos.y,
+                    (int)ImGui::IsWindowHovered(), (int)g_mainBeginOk);
+        }
+    }
+    g_lastHoverName = "(none)";   // debug: 每帧重置（防残留误导）
 
     // debug: 鼠标事件监听心跳 + 点击即时记录
     // ① 每次按键状态翻转即时打点——卡死时点击若出现 "mouse: DOWN" = 事件流活着（问题在热区/逻辑）；
