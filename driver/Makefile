@@ -27,7 +27,7 @@ ifdef DEBUG_BUILD
 DEFINES += -DDEBUG=1
 endif
 
-CFLAGS  := -arch $(ARCH) -bundle -O2 -DNDEBUG \
+CFLAGS  := -arch $(ARCH) -bundle -Os -DNDEBUG \
 	-mmacosx-version-min=12.0 \
 	-isysroot $(SDK) \
 	$(DEFINES) \

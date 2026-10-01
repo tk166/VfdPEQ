@@ -159,8 +159,22 @@
 | **驱动安装方式** | 启动时检测按需安装（/tmp 脚本 + privileged，源=随包 driver bundle）；不再依赖 scripts/install.sh | install.sh 的相对路径在 bundle 内失效；/tmp 脚本可携带任意源路径 |
 | **hover 路由自恢复** | 鼠标在窗口 rect 内但路由不认持续 0.5s → 注入"全键释放 + leave/re-enter"事件对 | 实测规律：路由只在"鼠标从窗口外重新进入"时重算；从菜单栏深处回来时进入失效态且不自恢复 |
 | **About 实现** | ImGui 模态弹窗（主窗口内渲染） | AppKit 独立窗口的 NSButton 点击触发不可恢复的 AppKit 卡死（多控件/多样式/权限变体全部实测）；ImGui 管线复用主窗口事件链免疫此问题 |
-| **仓库/打包工具** | 手写 package.sh（组装+签名+hdiutil DMG）；Swift svg2png（NSImage 渲染，alpha 保留） | qlmanage 缩略图管线合成白底丢 alpha；brew 装工具被沙箱策略拦截；CLT 自带 swiftc 零依赖 |
+| **仓库链接** | ImGui Selectable + NSWorkspace openURL | 在 ImGui 模态弹窗内触发（主窗口事件链），不经过 AppKit 控件层 |
+| **debug 日志运行时开关** | conf 字段 `debug_logging 0/1` → `peq_dbg_set_enabled()` → peq_dbg 内部丢弃 | About 复选框驱动；关闭时调用链/时序不变（仅输出静默） |
+| **仓库/打包工具** | 手写 package.sh（--build 全组件重编 + .app 组装 + ad-hoc 签名 + hdiutil DMG）；Swift svg2png（NSImage 渲染，alpha 保留） | qlmanage 缩略图管线合成白底丢 alpha；brew 装工具被沙箱策略拦截；CLT 自带 swiftc 零依赖 |
 
 ---
 
-*整理自 2026-09-29 ～ 10-01 的开发实录（Stage1 → tmp03 → 驱动常驻/SRC 架构 → 打包分发）。未关闭项：打包版（/Applications 启动）按启动方式 100% 复现"收不到系统音频"——排查结论指向 coreaudiod 混音器对虚拟设备写入的瞬态状态（系统层），全部排查数据与实验矩阵见 BAD_CASES F14 与日志。*
+## 最终验证结论（重启电脑后）
+
+**重启电脑清除了 coreaudiod 的深层状态残留**，全部功能验证通过：
+- 引擎 192k 固定采集 + SRC 转换 → DX1 II @ 48k → underrun=0 → 声音正常
+- 设备切换丝滑、Launch at login 正常、About 弹窗正常、状态栏图标三态正确
+- 配置路径 `~/.config/vfdpeq/` 读写正常、debug_logging 开关持久化正常
+- coreaudiod CPU 4.6% 稳定
+
+**"收不到系统音频"的根因**：不是驱动代码 bug（与 BlackHole HEAD 零功能差异），而是 **macOS 26.5.2 的 AudioServerPlugIn 框架在反复装卸驱动后 coreaudiod 进入深层状态残留**（`HALS_IOContext_Legacy_Impl` 的 IO workloop churn + OverloadReporter 队列积压 + TCC 缺 NSMicrophoneUsageDescription），**重启电脑是唯一可靠的清除方式**。Info.plist 加 `NSMicrophoneUsageDescription` 后 TCC 授权弹窗正常工作。
+
+---
+
+*整理自 2026-09-29 ～ 10-01 的开发实录（Stage1 → tmp07 → 打包分发 → 通关）。*

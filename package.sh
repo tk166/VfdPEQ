@@ -70,6 +70,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>       <string>APPL</string>
     <key>LSMinimumSystemVersion</key>    <string>12.0</string>
     <key>NSHighResolutionCapable</key>   <true/>
+    <key>NSMicrophoneUsageDescription</key> <string>VfdPEQ needs to receive system audio through its virtual device for EQ processing. No real microphone is accessed.</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
 </dict>
 </plist>
